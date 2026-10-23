@@ -1,0 +1,6 @@
+gallery-dl
+pandas
+numpy
+pillow
+requests
+onnxruntime-directml
