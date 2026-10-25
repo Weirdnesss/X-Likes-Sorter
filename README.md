@@ -1,36 +1,49 @@
-# X Likes & Bookmarks Character Sorter
+# X Likes & Bookmarks → Tagged → Hydrus
 
-Downloads your liked and bookmarked media from X (Twitter), tags each image with the **WD14 ConvNeXtV2** anime tagger, and sorts everything into character, series and artist folders. Tweet hashtags and authors (saved by `gallery-dl` as `.json` sidecars) are used to place the images the tagger can't recognize.
+Downloads your liked and bookmarked media from X (Twitter) with `gallery-dl`, tags every image with the **Camie Tagger v2** anime tagger (characters and series), and pushes the images into [Hydrus Network](https://hydrusnetwork.github.io/hydrus/index.html) together with the tweet's author, hashtags, URL, text and post date. Nothing is sorted into folders: Hydrus is where you search, fix and browse.
 
 ---
 
 ## Key Features
 
-- **One-click workflow:** `run_update.bat` has a menu for syncing, sorting, hashtag tools and undo, and also accepts commands directly.
-- **Automated downloads:** `gallery-dl` fetches Likes and Bookmarks together with full JSON metadata sidecars.
-- **AI character tagging:** the `wd-v1-4-convnextv2-tagger-v2` ONNX model runs on DirectML (AMD, Intel, Nvidia GPUs) and falls back to CPU if no GPU is usable.
-- **Tweet evidence for what the tagger misses:** hashtag rules, same-tweet siblings, series hashtags, author hints and artist folders.
-- **Fast re-sorting:** tagger scores are cached in SQLite (`data/scores_cache.db`), so changing rules or thresholds and re-sorting takes seconds.
-- **Non-destructive:** every sort can be previewed with `--dry-run`, every move is logged, and `undo` reverses the log.
-- **Portable:** all settings live in `config/config.json`, with no hardcoded drive letters or user names.
+- **One-click workflow:** `run_update.bat` fetches new likes and bookmarks, tags them and pushes them to Hydrus.
+- **Character and series tags:** Camie Tagger v2 (ONNX, DirectML on AMD, Intel and Nvidia GPUs, CPU fallback) with variant folding, so costume tags like `shiroko_(swimsuit)_(blue_archive)` count as `shiroko_(blue_archive)`.
+- **Tweet metadata, not just pixels:** author, hashtags, a "sensitive" flag, the tweet URL, the tweet text as a note, and the post date all go into Hydrus.
+- **Separate tag service:** every automatic tag goes to its own local Hydrus tag service (`camie` by default), so it never mixes with tags you write yourself.
+- **Safe to re-run:** files whose data hasn't changed are skipped, and files you deleted in Hydrus are never re-imported.
+- **Fast re-tagging:** scores are cached in SQLite, and tag thresholds are applied at push time, so changing them needs no rescan.
+- **Portable:** all settings live in `config/`, with no hardcoded drive letters or user names.
 
 ---
 
-## How Images Are Sorted
+## How It Works
 
-Each image goes to the first rule that places it:
+```text
+gallery-dl  ->  Incoming/Inbox  ->  intake (tag)  ->  push_to_hydrus.py  ->  Hydrus
+ likes +        images + .json      Camie scores       import + tags + URL     your library
+ bookmarks      sidecars            cached in data/    + note + post date
+```
 
-1. **Tagger:** a character recognized with enough confidence and a clear lead over the runner-up goes to that character's folder.
-2. **Character hashtags** from `config/hashtag_map.csv`.
-3. **Same-tweet siblings:** other images from the same tweet that the tagger did identify.
-4. **Series hashtags** (`_Series/<name>` rules in the map).
-5. **Author hints:** if an artist's confirmed images are overwhelmingly one character, their other images follow.
-6. **Artist folders:** leftovers go to `_Artists/<handle>` when that artist has enough of them.
-7. Everything else stays in `_Unsorted`.
+1. **Fetch:** `gallery-dl` saves new images and a `.json` sidecar per image into `Incoming/Inbox`. A download archive (`data/archive.sqlite3`) stops anything being downloaded twice.
+2. **Intake:** sidecars are read (hashtags and author are merged into `data/tweet_hashtags.csv`) and moved to `Meta/`. Every new image is scored by Camie and the scores are cached. Images stay where they are.
+3. **Push:** each image is imported into Hydrus by path, then tagged, linked to its tweet, given a note and a post date.
 
-Other outcomes: `_Review/<character>` holds weak guesses (between `review_threshold` and `confidence_threshold`), `_Multiple` holds images with several characters and no clear lead, and `_Misc Characters` holds characters with fewer than `min_folder_size` images. Folder names are configurable.
+Your library lives under `parent_dir`: `Incoming/Inbox` (new downloads) and `Meta/` (processed sidecars).
 
-Expect a sizable share of a large library to end up in `_Unsorted`, `_Multiple` or artist/series folders. That's normal for art with original characters or characters the model doesn't know.
+### Tags sent to Hydrus
+
+| Tag | Source |
+|---|---|
+| `character:<name>` | Camie character score at or above `character_threshold` (default 0.5) |
+| `possible character:<name>` | Score between `possible_threshold` (0.3) and `character_threshold` |
+| `series:<name>` | Camie copyright score at or above `series_threshold` (0.5) |
+| `creator:<handle>` | Tweet author, exactly as on X |
+| `hashtag:<tag>` | Tweet hashtags (at most `max_hashtags`) |
+| `x flag:sensitive` | Set when X flagged the tweet as sensitive |
+
+No general tags (hair colour, clothing and so on) are sent. Names are Danbooru-style with underscores turned into spaces, for example `character:hu tao (genshin impact)`.
+
+Besides tags, each image gets the tweet URL as a known URL, the tweet text as a note named `tweet` (with a header line of `@handle | date | url`), and the post date as its "modified time" for the domain `x.com`.
 
 ---
 
@@ -39,20 +52,21 @@ Expect a sizable share of a large library to end up in `_Unsorted`, `_Multiple` 
 ```text
 x-likes-sorter/
 ├── config/
-│   ├── config.example.json  # Every option with its default (tracked in git)
-│   ├── config.json          # Your settings (created by setup.bat, not tracked)
-│   └── hashtag_map.csv      # Hashtag-to-folder rules (tracked in git)
-├── data/                    # Generated: score cache, tweet_hashtags.csv, sort log, download archive
-├── model/                   # Generated: auto-downloaded WD14 model and tag list
-├── .gitignore               # Keeps cookies, config.json, data/ and model/ out of git
+│   ├── config.example.json   # Every option with its default (tracked in git)
+│   ├── config.json           # Your settings (created by setup.bat, not tracked)
+│   ├── hydrus.example.json   # Hydrus settings template (tracked in git)
+│   ├── hydrus.json           # Your Hydrus settings and API key (NOT tracked)
+│   └── hashtag_map.csv       # Only used by the legacy sorting commands
+├── data/                     # Generated: score cache, tweet_hashtags.csv, download archive, push records
+├── model/                    # Generated: auto-downloaded Camie model and metadata
+├── .gitignore                # Keeps cookies, config.json, hydrus.json, data/ and model/ out of git
 ├── README.md
-├── char_sorter.py           # Tagging, sidecar ingestion and sorting logic
+├── char_sorter.py            # Tagging and sidecar ingestion (plus the legacy sorting code)
+├── push_to_hydrus.py         # Sends tagged images to Hydrus
 ├── requirements.txt
-├── run_update.bat           # Menu and command runner
-└── setup.bat                # One-time installer
+├── run_update.bat            # Menu and command runner
+└── setup.bat                 # One-time installer
 ```
-
-Your library lives under `parent_dir`: `Incoming/Inbox` (new downloads), `Sorted/` (the result) and `Meta/` (processed sidecars).
 
 ---
 
@@ -60,7 +74,7 @@ Your library lives under `parent_dir`: `Incoming/Inbox` (new downloads), `Sorted
 
 1. **Windows 10/11**
 2. **Python 3.10+** added to `PATH`
-3. **Git** (only if you clone the repo)
+3. **Hydrus Network** running on the same PC (images are imported by file path)
 4. An **X/Twitter account**
 
 ---
@@ -68,23 +82,26 @@ Your library lives under `parent_dir`: `Incoming/Inbox` (new downloads), `Sorted
 ## Quick Start (Fresh PC Setup)
 
 1. **Get the project:** `git clone https://github.com/your-username/x-likes-sorter.git`, then `cd x-likes-sorter`.
-2. **Run `setup.bat`.** It creates the virtual environment, installs the requirements, creates `config/`, `data/` and `model/`, and copies `config/config.example.json` to `config/config.json` if you don't have one.
+2. **Run `setup.bat`.** It creates the virtual environment, installs the requirements, creates `config/`, `data/` and `model/`, and copies `config/config.example.json` to `config/config.json`.
 3. **Export your X cookies** from a logged-in browser (for example with the *Get cookies.txt LOCALLY* extension) and save them as `cookies.txt` in the project folder.
-4. **Edit `config/config.json`:** set `twitter_username` (without `@`) and `parent_dir`. Use a full path with doubled backslashes (`"D:\\X_Likes"`) or a plain name like `"X_Likes"` to keep the library next to the project.
-5. **Run `run_update.bat`** and pick option 1.
+4. **Edit `config/config.json`:** set `twitter_username` (without `@`), `parent_dir` (a full path with doubled backslashes such as `"D:\\X_Likes"`, or a plain name to keep the library next to the project) and `"tagger_backend": "camie"`.
+5. **Set up Hydrus** (next section).
+6. **Run `run_update.bat`** and pick option 1.
 
----
+### Setting up Hydrus (once)
 
-## Getting the Best Results (Recommended Order)
+1. **Enable the Client API:** *services > manage services > add > client api*. Keep the default port `45869` unless you need another.
+2. **Create a local tag service named `camie`:** *services > manage services > add > local tag service*. (Not *review services*, which only shows existing ones.)
+3. **Create an access key:** *services > review services > client api > add > manually*. Give it these permissions:
+   - Import and Edit URLs
+   - Import and Delete Files
+   - Edit File Tags
+   - Edit File Notes
+   - Edit File Times
+4. **Copy `config/hydrus.example.json` to `config/hydrus.json`** and paste the 64-character key into `access_key`. You can set the `HYDRUS_ACCESS_KEY` environment variable instead.
+5. **Test it:** run menu option 4. It prints the key's permissions and confirms the `camie` tag service.
 
-1. **Benchmark first.** Run menu option 12, then set `dml_device_id` and `batch_size` to the fastest combination. Low-VRAM GPUs are often fastest at `batch_size` 1.
-2. **First full sync.** Set `"gallery_dl_abort": 0` so gallery-dl doesn't stop early, run option 1, then set it back to `10`. X may not serve your oldest likes, so the first sync might not reach all of them.
-3. **Build a hashtag map.** Run option 8 (preview the suggestions), then option 9 to add them. Add series tags by hand as `_Series/<name>`; option 7 shows which hashtags are most common. Save the CSV as UTF-8.
-4. **Preview, check, apply.** Run option 4 (full re-sort preview), spot-check about 20 rows in `sort_preview.csv` for each source (`hashtag`, `author`, `artist`), then run option 5.
-5. **See what's left.** Run option 11 for the top hashtags and artists among unsorted images, add rules, and repeat steps 4 and 5.
-6. **Settings:** an `artist_folder_min` of about 5 organizes leftovers well. Leave `review_threshold` and `primary_margin` alone unless a dry run shows a clear gain, and change one setting at a time.
-
-Afterwards: run option 1 whenever you like new things, and a full re-sort (4, then 5) after changing the hashtag map or any sorting setting.
+**Storage tip:** keep Hydrus's database and thumbnails on your fastest drive and its media files wherever there's room (*database > migrate database*). Back up both the `db` folder and the media folder.
 
 ---
 
@@ -93,71 +110,67 @@ Afterwards: run option 1 whenever you like new things, and a full re-sort (4, th
 Double-click **`run_update.bat`**:
 
 ```text
- SYNC & SORT NEW FILES
-  [1] Sync (Fetch Likes + Bookmarks + Tag + Sort)
-  [2] Process Inbox Only (files already in Inbox)
-  [3] Inbox Dry-Run Preview (no files moved)
+ NEW LIKES
+  [1] Sync (Fetch Likes + Bookmarks + Tag + Push To Hydrus)
+  [2] Tag + Push What Is Already In The Inbox
+  [3] Push Preview (dry run, Hydrus not contacted)
 
- WHOLE LIBRARY
-  [4] Full Re-sort Preview (dry run)
-  [5] Full Re-sort (moves files)
-  [6] Undo Moves From The Sort Log
-
- HASHTAGS
-  [7] Top Unmapped Hashtags
-  [8] Suggest Hashtag Rules (preview)
-  [9] Suggest Hashtag Rules (add to hashtag_map.csv)
-  [10] Rebuild Hashtag Data (from saved sidecars)
-  [11] Report On Unsorted Images (run option 4 first)
+ HYDRUS
+  [4] Check Hydrus Connection (key, permissions, tag service)
+  [5] Re-push Everything That Changed (after tag or threshold edits)
 
  TOOLS
-  [12] Benchmark GPU / Batch Size
+  [6] Benchmark GPU / Batch Size
 
   [0] Exit
 ```
 
-- **[1]** fetches Likes and Bookmarks (each can be turned off in the config), reads the sidecars, downloads the model on first use, tags the new images and sorts them.
-- **[2] / [3]** process or preview only the files currently in the Inbox. A dry run writes `sort_preview.csv` (columns: file, folder, source) and moves nothing.
-- **[4] / [5]** re-plan the *whole* library, including files that are already sorted. Options that move files ask for confirmation.
-- **[6]** reverses *every* move in `data/sort_log.csv`, not just the last run.
+- **[1]** checks that Hydrus is reachable first (so you don't download for nothing), fetches Likes and Bookmarks (each can be turned off in the config), tags the new images and pushes them. **Open Hydrus before running it.**
+- **[2]** does the tag and push steps for files already in the Inbox, for example after an interrupted run.
+- **[3]** shows what would be sent (counts and a few example payloads) without contacting Hydrus.
+- **[5]** re-pushes every image whose tags, URL, note or date changed since its last push, across the whole cache, not only the Inbox.
 
 ### Running commands without the menu
-`run_update.bat` also accepts a command (useful for Task Scheduler and quick one-offs):
 
 ```cmd
-run_update.bat sync                   :: the full sync flow from option 1
-run_update.bat sort --dry-run         :: any char_sorter.py command and options
-run_update.bat suggest-map --apply
-run_update.bat tags --top 100
+run_update.bat sync       :: the full flow from option 1 (good for Task Scheduler)
+run_update.bat push       :: tag + push the Inbox (option 2)
+run_update.bat check      :: test the Hydrus connection (option 4)
+run_update.bat bench      :: any char_sorter.py command
 ```
 
-Or activate the environment (`call venv\Scripts\activate`) and run `char_sorter.py` directly:
+Or activate the environment (`call venv\Scripts\activate`) and call the scripts directly:
 
 | Command | What it does |
 |---|---|
-| `python char_sorter.py inbox [--dry-run]` | Ingest sidecars, tag and sort the Inbox. |
-| `python char_sorter.py scan` | Tag every image in `Sorted/` that isn't cached yet. |
-| `python char_sorter.py sort [--dry-run]` | Re-plan and sort the whole library from cached scores. |
-| `python char_sorter.py undo` | Reverse every move in `data/sort_log.csv`. |
-| `python char_sorter.py tags [--all] [--top N]` | Most common hashtags (by default only those without a rule). |
-| `python char_sorter.py report [--top N]` | Hashtags and artists among unsorted images (after a dry run). |
-| `python char_sorter.py suggest-map [--apply] [--min-tweets N] [--min-share X]` | Suggest hashtag rules from your tagged images. |
-| `python char_sorter.py rebuild-tags [folder-or-csv ...]` | Rebuild hashtag data from sidecars or an old CSV. |
+| `python char_sorter.py intake` | Read sidecars and tag every new image in the Inbox (nothing is moved). |
 | `python char_sorter.py bench` | Benchmark the tagger. |
+| `python push_to_hydrus.py --check` | Test connection, key, permissions and tag service. |
+| `python push_to_hydrus.py --dry-run --limit 5` | Show what would be sent. Never contacts Hydrus. |
+| `python push_to_hydrus.py --limit 50` | Push a small batch first. |
+| `python push_to_hydrus.py` | Push everything not yet pushed. |
+| `python push_to_hydrus.py --force` | Re-send even files that look unchanged. |
+| `python push_to_hydrus.py --folder "D:\X_Likes\Incoming\Inbox"` | Only images under one folder. |
+
+### Importing an existing library
+
+If you already have images on disk, scan them once (`python char_sorter.py scan` tags images under the sorted folder; use `--limit` on the push to try 50 first), then run `python push_to_hydrus.py`. The push can take a while on tens of thousands of files, and an interrupted run resumes where it stopped.
 
 ---
 
 ## Configuration
 
-`config/config.json` only needs the keys you want to change; anything missing uses the default. `config/config.example.json` lists every option. A misspelled key prints a warning when the script runs.
+### `config/config.json`
+
+Only needs the keys you want to change; anything missing uses the default. `config/config.example.json` lists every option. A misspelled key prints a warning.
 
 ```json
 {
   "twitter_username": "your_twitter_handle",
   "parent_dir": "D:\\X_Likes",
+  "tagger_backend": "camie",
   "batch_size": 1,
-  "dml_device_id": null,
-  "artist_folder_min": 5
+  "dml_device_id": null
 }
 ```
 
@@ -171,72 +184,70 @@ Or activate the environment (`call venv\Scripts\activate`) and run `char_sorter.
 | `gallery_dl_abort` | `10` | Stop a feed after this many already-downloaded files in a row. `0` = never stop early. |
 | `gallery_dl_extra_args` | `""` | Extra gallery-dl arguments, e.g. `"--sleep-request 1"`. Avoid `%` and `&`. |
 | `cookies_file` | `cookies.txt` | Cookie file used for downloads. |
+| `tagger_backend` | `wd14` | Set to `camie` for this workflow. Each backend keeps its own model files and score cache (`data/scores_cache_camie.db`). |
+| `camie_model_url` / `camie_metadata_url` | Camie Tagger v2 | Files downloaded on first use. |
 | `dml_device_id` | `null` | GPU for DirectML. `null` = auto-detect. Use `bench` to find the fastest. |
-| `batch_size` | `4` | Images per tagger pass. Run `bench`; `1` is often best on 2 GB GPUs. |
+| `batch_size` | `4` | Images per tagger pass. `1` is often best on 2 GB GPUs. |
 | `io_threads` | `4` | Threads that load images while the GPU works. |
-| `cache_min_score` | `0.10` | Guesses below this aren't cached. Lowering it needs a rescan; keep it at or below `review_threshold`. |
+| `cache_min_score` | `0.10` | Guesses below this aren't cached. Keep it at or below `possible_threshold`. |
 | `image_extensions` | jpg, jpeg, png, webp | File types picked up. |
-| `model_url` / `tags_url` | WD14 ConvNeXtV2 v2 | Tagger files to download. Switching models also needs `model/` emptied and `data/scores_cache.db` deleted, since scores aren't comparable. |
-| `confidence_threshold` | `0.35` | Minimum score to place an image by the tagger. |
-| `review_threshold` | `0.20` | Guesses between this and `confidence_threshold` go to `_Review`. |
-| `primary_margin` | `0.25` | How far ahead the top character must be to avoid `_Multiple`. |
-| `min_folder_size` | `3` | Fewer images than this and a character goes to `_Misc Characters`. |
-| `use_sibling_hints` | `true` | Place an image using other images from the same tweet. |
-| `use_author_hints` | `true` | Route by what the artist usually draws. |
-| `author_min_tweets` / `author_min_share` | `3` / `0.8` | An artist needs this many confirmed tweets, with this share the same character. |
-| `artist_folder_min` | `8` | Leftovers go to `_Artists/<handle>` if the artist has this many. `0` = off. |
-| `folder_unsorted`, `folder_multiple`, `folder_review`, `folder_misc`, `folder_artists` | `_Unsorted`, `_Multiple`, `_Review`, `_Misc Characters`, `_Artists` | Folder names inside `Sorted/`. Renaming on an existing library moves files on the next full sort. |
-| `summary_top_folders` | `25` | How many folders the sort summary lists. |
+| `merge_variants` | `true` | Folds costume and form variants into the base character. |
+| `character_aliases` | `{}` | Merge tags you consider the same character, e.g. `{"trailblazer_(honkai:_star_rail)": "stelle_(honkai:_star_rail)"}`. |
+
+Camie's score thresholds for the Hydrus tags live in `hydrus.json`, not here. `confidence_threshold`, `review_threshold`, `primary_margin` and the other sorting keys only affect the legacy sorting commands.
 
 JSON needs doubled backslashes in Windows paths, no trailing comma after the last entry, and no comments. The file may be UTF-8 with or without a BOM.
 
----
+### `config/hydrus.json`
 
-## Hashtags
+| Key | Default | What it does |
+|---|---|---|
+| `api_url` | `http://127.0.0.1:45869` | Where the Hydrus Client API listens. |
+| `access_key` | `""` | The 64-character API key (or use `HYDRUS_ACCESS_KEY`). |
+| `tag_service_name` | `camie` | The local tag service that receives the tags. |
+| `tag_service_key` | `""` | Optional: use this service key instead of looking the name up. |
+| `character_threshold` | `0.5` | Score for a `character:` tag. |
+| `possible_threshold` | `0.3` | Score for a `possible character:` tag. |
+| `series_threshold` | `0.5` | Score for a `series:` tag. |
+| `add_creator` / `add_hashtags` | `true` | Send `creator:` and `hashtag:` tags. |
+| `hashtag_namespace` / `max_hashtags` | `hashtag` / `30` | Namespace and cap for hashtag tags. |
+| `sensitive_tag` | `x flag:sensitive` | Tag for sensitive tweets. Empty = off. |
+| `add_url` / `add_note` / `set_post_date` | `true` | Send the tweet URL, the tweet text note, and the post date. |
+| `note_name` / `date_domain` | `tweet` / `x.com` | Name of the note and domain of the timestamp. |
+| `delete_after_import` | `false` | Hydrus deletes the original file from disk after importing it. See below. |
+| `max_workers` | `24` | Parallel Hydrus API workers (1-24). Lower it if Hydrus becomes sluggish. |
+| `max_consecutive_errors` | `10` | Stop the run after this many failures in a row. |
 
-### Hashtag map (`config/hashtag_map.csv`)
-Maps a hashtag (lowercase, without `#`) to a folder relative to `Sorted/`:
+**Changing thresholds later only adds tags.** A push never removes a tag, so lowering a threshold adds more and raising it leaves the old ones in place. Fix wrong tags in Hydrus itself.
 
-```csv
-hashtag,folder
-bluearchive,_Series/Blue Archive
-genshinimpact,_Series/Genshin Impact
-hutao,Hu Tao
-```
-
-- Rules starting with `_Series/` group images under a franchise folder.
-- Save the file as UTF-8 (Notepad: *Save As* > Encoding UTF-8; Excel: *CSV UTF-8*), or Japanese hashtags won't match. A BOM is fine. Keep the header line `hashtag,folder`.
-- There is no downloadable map; which hashtags mean which character depends on what you like. Build yours with `suggest-map` and by hand.
-
-### Hashtag data (`data/tweet_hashtags.csv`)
-Built automatically from the `.json` sidecars `gallery-dl` writes: on each sync the tweet ID, hashtags and author are merged into this file, and the sidecars are then moved to `Meta/`. It is machine-generated, so don't edit it.
-
-- **Lost or incomplete?** `rebuild-tags` (menu option 10) re-reads every sidecar in `Meta/` and `Inbox/`. You can also point it at an old `tweet_hashtags.csv` or any folder of sidecars; data is merged, never overwritten.
-- **Authors missing for old likes?** Re-fetch the metadata only: `gallery-dl --cookies cookies.txt --no-download --write-metadata "https://x.com/<handle>/likes" -d "<parent_dir>\Meta_refetch"`, then `rebuild-tags "<parent_dir>\Meta_refetch"`. Try a few items first (`--range 1-20`) to confirm sidecars are written.
-- Images are matched to tweets by the tweet ID in the filename (`<tweet_id>_<n>.<ext>`, gallery-dl's default). Renamed files lose hashtag and author routing.
-
-### Suggesting rules (`suggest-map`)
-Looks at tweets where the tagger identified exactly one character and suggests hashtags that point to the same character on at least 5 tweets (80% or more of the time, from at least 3 different artists). It writes `config/hashtag_map_suggested.csv`; copy the rows you want into the map or use `--apply` to append them all. The tagger's mistakes get copied into the rules too, so skim the list before applying.
+**`delete_after_import`:** Hydrus copies the files it imports, so the Inbox keeps a second copy of every image. Once a small test push looks right in Hydrus, set this to `true` and the Inbox empties itself as you go. The gallery-dl archive prevents re-downloads and `Meta/` keeps the sidecars.
 
 ---
 
-## Author Hints and Artist Folders
+## Working in Hydrus
 
-**Author hints** route unrecognized images by what the artist usually draws. An artist qualifies with at least `author_min_tweets` tagger-confirmed tweets, at least `author_min_share` of them the same character. Only tagger-confirmed images count as evidence, so hashtag and sibling placements never feed back in. Hints apply only to `_Review` and `_Unsorted` images, after every other rule has failed. `_Multiple` is never touched. Check the rows with source `author` in `sort_preview.csv` before applying.
-
-**Artist folders** group whatever is still unplaced into `Sorted/_Artists/<handle>`, for artists with at least `artist_folder_min` such images. Artists below the minimum stay in `_Unsorted`. Counts are library-wide: if you only process the Inbox, older images stay in `_Unsorted` until the next full re-sort.
+- **Costume variants:** if Camie tags a costume as its own character, merge them with a tag sibling (for example `character:shiroko (swimsuit) (blue archive)` → `character:shiroko (blue archive)`). It applies retroactively to everything already imported.
+- **Characters the tagger doesn't know** (new releases especially): search the `hashtag:` tag for that character, select all, and add the character tag yourself under *my tags*. Your own tags stay separate from the `camie` service.
+- **Review the guesses:** search `possible character:*` to confirm or correct the weaker guesses.
+- **Everything from one artist:** search `creator:<handle>`.
+- **Tweet text** is stored as a note named `tweet`. Notes are shown in the media viewer and the right-hand notes panel.
+- **Deleted files stay deleted.** Anything you delete in Hydrus is reported as "previously deleted" and skipped on later pushes.
 
 ---
 
-## Good to Know
+## Hashtag Data (`data/tweet_hashtags.csv`)
 
-- **Don't move files by hand.** The cache is keyed by file path, so manually moved files are invisible to `sort` and aren't learned from. A later full `scan` can score them again, and the next `sort` may move them back.
-- **Empty folders in `Sorted/` are not removed automatically** after a re-sort. To remove them (preview first, then run it without `-WhatIf`):
-  ```powershell
-  Get-ChildItem "D:\X_Likes\Sorted" -Directory -Recurse | Sort-Object { $_.FullName.Length } -Descending | Where-Object { -not (Get-ChildItem $_.FullName -Force) } | Remove-Item -WhatIf
-  ```
-- **Menu options 1-3 only touch the Inbox.** To re-sort files that are already sorted, use options 4 and 5.
-- **Undo reverses the whole sort log**, not just the last run. To undo only a single run, rename `data/sort_log.csv` to `sort_log_old.csv` before you start it.
+Built automatically from the `.json` sidecars `gallery-dl` writes: on each intake the tweet ID, hashtags and author are merged into this file and the sidecars are moved to `Meta/`. It is machine-generated, so don't edit it. The push reads the sidecars themselves (from `Meta/` and `Inbox/`) for the tweet text, date and sensitive flag.
+
+- **Lost or incomplete?** `python char_sorter.py rebuild-tags` re-reads every sidecar in `Meta/` and `Inbox/`. You can also point it at an old `tweet_hashtags.csv` or a folder of sidecars. Data is merged, never overwritten.
+- **Authors missing for old likes?** Re-fetch metadata only: `gallery-dl --cookies cookies.txt --no-download --write-metadata "https://x.com/<handle>/likes" -d "<parent_dir>\Meta_refetch"`, then `rebuild-tags "<parent_dir>\Meta_refetch"`. Try `--range 1-20` first to confirm sidecars are written, and put the re-fetched sidecars under `Meta/` so the push can see them.
+- Images are matched to tweets by the tweet ID in the filename (`<tweet_id>_<n>.<ext>`, gallery-dl's default). Renamed files lose their tweet metadata.
+
+---
+
+## Legacy Sorting Commands
+
+The folder sorter this project started as is still in `char_sorter.py` (`sort`, `undo`, `inbox`, `tags`, `suggest-map`, `report`, `multiples`, `learn`, `export-hydrus`). It no longer has menu entries and isn't part of the flow above, but it keeps working through `run_update.bat <command>` if you want it. `config/hashtag_map.csv` and the sorting keys in `config.json` only matter for those commands.
 
 ---
 
@@ -245,16 +256,20 @@ Looks at tweets where the tagger identified exactly one character and suggests h
 | Problem | What to do |
 |---|---|
 | `[downloader.http][warning] ... Connection aborted ... (1/5)` | gallery-dl is retrying a dropped connection. Ignore it if the file downloads; if it keeps happening set `gallery_dl_sleep` to `1` and raise `gallery_dl_retries`. Failed files are retried on the next sync. |
-| First run seems to hang | The model is downloading (a few hundred MB, one time) and prints progress every 25 MB. An interrupted download leaves only a `.part` file and is safely restarted. |
-| `Hashtag rules: 0` or `tweets with hashtag data: 0` | Check `config/hashtag_map.csv` (UTF-8, header `hashtag,folder`) and run `rebuild-tags`. |
-| Warning: unknown config keys | A key in `config.json` is misspelled. Compare it with `config.example.json`. |
-| `Failed to read config.json` | The JSON is invalid (single backslashes, trailing comma, comments). Fix it; defaults are used until then. |
+| First run seems to hang | The Camie model is downloading (one time). An interrupted download is restarted safely. |
+| `Could not reach Hydrus` | Open the Hydrus client, make sure the Client API service is enabled and the port matches `api_url`. |
+| `Hydrus rejected the access key` | Re-copy the key into `config/hydrus.json`, or check the key still exists under *review services > client api*. |
+| `Hydrus has no tag service named "camie"` | Create a local tag service with that name under *manage services*, or set `tag_service_name`. |
+| `The access key lacks '...'` | Add the named permission to the key in Hydrus, then re-run. Files pushed without it aren't marked done, so they're retried. |
+| Files show as "previously deleted" | You deleted them in Hydrus earlier. That's intentional. |
+| 0 images with tags or no tweet data | Check that `Meta/` and `Inbox/` contain the `.json` sidecars, and run `rebuild-tags`. |
+| Warning: unknown config keys | A key is misspelled. Compare it with the example file. |
+| `Failed to read config.json` | The JSON is invalid (single backslashes, trailing comma, comments). |
 | Tagger is slow or scanning stalls | Run `bench` and set `dml_device_id` and `batch_size` (try `1`). |
 | `venv not found` | Run `setup.bat` first. |
-| Author hints find 0 artists | Authors are missing from `tweet_hashtags.csv`. See "Authors missing for old likes?" above. |
 
 ---
 
 ## Sharing With Friends
 
-Send the repo. `.gitignore` keeps out your `cookies.txt`, `config/config.json`, `data/` and `model/`, so none of your private data goes along. `config/hashtag_map.csv` is included, so they start with your hashtag rules and can add their own. They run `setup.bat`, add their own `cookies.txt`, edit `config/config.json`, and follow "Getting the Best Results" above.
+Send the repo. `.gitignore` keeps out your `cookies.txt`, `config/config.json`, `config/hydrus.json` (which holds your API key), `data/` and `model/`, so none of your private data goes along. They run `setup.bat`, add their own `cookies.txt`, edit `config/config.json` and `config/hydrus.json`, and follow the Quick Start above.

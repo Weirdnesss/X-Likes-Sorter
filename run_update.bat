@@ -1,5 +1,5 @@
 @echo off
-title X Likes ^& Bookmarks Sync ^& Sorter
+title X Likes ^& Bookmarks Sync ^> Hydrus
 cd /d "%~dp0"
 
 if not exist "venv\Scripts\activate.bat" (
@@ -38,37 +38,29 @@ if not "%GDL_ABORT%"=="0" set "GDL_EXTRA=%GDL_EXTRA% --abort %GDL_ABORT%"
 if defined GDL_USER_ARGS set "GDL_EXTRA=%GDL_EXTRA% %GDL_USER_ARGS%"
 set "INBOX_DIR=%PARENT_DIR%\Incoming\Inbox"
 
-:: ---- Command-line mode: run_update.bat sync   or   run_update.bat <char_sorter command> [options] ----
+:: ---- Command-line mode: run_update.bat sync | push | check   or   run_update.bat <char_sorter command> [options] ----
 if not "%~1"=="" goto cli
 
 :menu
 cls
 echo =========================================
-echo   X Likes ^& Bookmarks Sync ^& Sorter
+echo   X Likes ^& Bookmarks  -^>  Tag  -^>  Hydrus
 echo =========================================
 echo.
 echo Active Account: @%TWITTER_USER%
 echo Library:        %PARENT_DIR%
 echo.
-echo  SYNC ^& SORT NEW FILES
-echo   [1] Sync (Fetch Likes + Bookmarks + Tag + Sort)
-echo   [2] Process Inbox Only (files already in Inbox)
-echo   [3] Inbox Dry-Run Preview (no files moved)
+echo  NEW LIKES
+echo   [1] Sync (Fetch Likes + Bookmarks + Tag + Push To Hydrus)
+echo   [2] Tag + Push What Is Already In The Inbox
+echo   [3] Push Preview (dry run, Hydrus not contacted)
 echo.
-echo  WHOLE LIBRARY
-echo   [4] Full Re-sort Preview (dry run)
-echo   [5] Full Re-sort (moves files)
-echo   [6] Undo Moves From The Sort Log
-echo.
-echo  HASHTAGS
-echo   [7] Top Unmapped Hashtags
-echo   [8] Suggest Hashtag Rules (preview)
-echo   [9] Suggest Hashtag Rules (add to hashtag_map.csv)
-echo   [10] Rebuild Hashtag Data (from saved sidecars)
-echo   [11] Report On Unsorted Images (run option 4 first)
+echo  HYDRUS
+echo   [4] Check Hydrus Connection (key, permissions, tag service)
+echo   [5] Re-push Everything That Changed (after tag or threshold edits)
 echo.
 echo  TOOLS
-echo   [12] Benchmark GPU / Batch Size
+echo   [6] Benchmark GPU / Batch Size
 echo.
 echo   [0] Exit
 echo.
@@ -76,47 +68,13 @@ set "choice="
 set /p choice="Select an option: "
 
 if "%choice%"=="1" call :do_sync & goto finish
-if "%choice%"=="2" python char_sorter.py inbox & goto finish
-if "%choice%"=="3" python char_sorter.py inbox --dry-run & goto finish
-if "%choice%"=="4" python char_sorter.py sort --dry-run & goto finish
-if "%choice%"=="5" goto resort
-if "%choice%"=="6" goto undo
-if "%choice%"=="7" python char_sorter.py tags --top 50 & goto finish
-if "%choice%"=="8" python char_sorter.py suggest-map & goto finish
-if "%choice%"=="9" goto suggest_apply
-if "%choice%"=="10" python char_sorter.py rebuild-tags & goto finish
-if "%choice%"=="11" python char_sorter.py report --top 40 & goto finish
-if "%choice%"=="12" python char_sorter.py bench & goto finish
+if "%choice%"=="2" call :do_process & goto finish
+if "%choice%"=="3" python push_to_hydrus.py --dry-run --folder "%INBOX_DIR%" & goto finish
+if "%choice%"=="4" python push_to_hydrus.py --check & goto finish
+if "%choice%"=="5" python push_to_hydrus.py & goto finish
+if "%choice%"=="6" python char_sorter.py bench & goto finish
 if "%choice%"=="0" exit /b
 goto menu
-
-:resort
-echo.
-echo This moves files inside %PARENT_DIR%\Sorted using your current rules.
-echo Tip: run option 4 first to preview. Moves are logged, so option 6 can undo them.
-set "ok="
-set /p ok="Continue? (y/n): "
-if /i not "%ok%"=="y" goto finish
-python char_sorter.py sort
-goto finish
-
-:undo
-echo.
-echo This reverses EVERY move recorded in data\sort_log.csv, not just the last run.
-set "ok="
-set /p ok="Continue? (y/n): "
-if /i not "%ok%"=="y" goto finish
-python char_sorter.py undo
-goto finish
-
-:suggest_apply
-echo.
-echo This appends every suggested rule to config\hashtag_map.csv. Option 8 shows them first.
-set "ok="
-set /p ok="Continue? (y/n): "
-if /i not "%ok%"=="y" goto finish
-python char_sorter.py suggest-map --apply
-goto finish
 
 :finish
 echo.
@@ -128,6 +86,8 @@ goto menu
 
 :cli
 if /i "%~1"=="sync" goto cli_sync
+if /i "%~1"=="push" goto cli_push
+if /i "%~1"=="check" goto cli_check
 python char_sorter.py %*
 exit /b %errorlevel%
 
@@ -135,7 +95,15 @@ exit /b %errorlevel%
 call :do_sync
 exit /b %errorlevel%
 
-:: ---- Subroutine: fetch likes and bookmarks, then tag and sort the Inbox ----
+:cli_push
+call :do_process
+exit /b %errorlevel%
+
+:cli_check
+python push_to_hydrus.py --check
+exit /b %errorlevel%
+
+:: ---- Subroutine: fetch likes and bookmarks, then tag and push the Inbox ----
 :do_sync
 if not exist "%COOKIES%" (
     echo [!] ERROR: %COOKIES% was not found.
@@ -145,21 +113,36 @@ if not exist "%COOKIES%" (
 if "%TWITTER_USER%"=="" goto no_user
 if /i "%TWITTER_USER%"=="YOUR_USERNAME_HERE" goto no_user
 
+:: Fail fast if Hydrus is not open, before spending time downloading and tagging.
+python push_to_hydrus.py --check
+if errorlevel 1 (
+    echo [!] Hydrus is not reachable. Open Hydrus, then run this again.
+    exit /b 1
+)
+
 if not "%FETCH_LIKES%"=="1" goto skip_likes
-echo [1/2] Fetching X Likes for @%TWITTER_USER%...
+echo.
+echo [1/3] Fetching X Likes for @%TWITTER_USER%...
 gallery-dl %GDL_EXTRA% --cookies "%COOKIES%" --download-archive data\archive.sqlite3 -o archive-event=file,skip --write-metadata "https://x.com/%TWITTER_USER%/likes" -d "%INBOX_DIR%"
 :skip_likes
 
 if not "%FETCH_BOOKMARKS%"=="1" goto skip_bookmarks
 echo.
-echo [2/2] Fetching X Bookmarks...
+echo [2/3] Fetching X Bookmarks...
 gallery-dl %GDL_EXTRA% --cookies "%COOKIES%" --download-archive data\archive.sqlite3 -o archive-event=file,skip --write-metadata "https://x.com/i/bookmarks" -d "%INBOX_DIR%"
 :skip_bookmarks
 
 echo.
-echo Processing all downloaded files...
-python char_sorter.py inbox
-exit /b
+echo [3/3] Tagging and pushing to Hydrus...
+call :do_process
+exit /b %errorlevel%
+
+:: ---- Subroutine: tag new Inbox images (no moving), then push them to Hydrus ----
+:do_process
+python char_sorter.py intake
+if errorlevel 1 exit /b 1
+python push_to_hydrus.py --folder "%INBOX_DIR%"
+exit /b %errorlevel%
 
 :no_user
 echo [!] ERROR: set "twitter_username" in config\config.json first.

@@ -1,0 +1,11 @@
+{
+  "api_url": "http://127.0.0.1:45869",
+  "access_key": "PASTE-YOUR-64-CHARACTER-KEY-HERE",
+  "tag_service_name": "camie",
+  "character_threshold": 0.5,
+  "possible_threshold": 0.3,
+  "series_threshold": 0.5,
+  "hashtag_namespace": "hashtag",
+  "set_post_date": true,
+  "delete_after_import": false
+}

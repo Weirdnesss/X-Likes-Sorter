@@ -7,3 +7,4 @@ venv/
 __pycache__/
 sort_preview.csv
 config/hashtag_map_suggested.csv
+config/hydrus.json
