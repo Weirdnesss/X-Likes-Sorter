@@ -9,6 +9,7 @@ Downloads your liked and bookmarked media from X (Twitter) with `gallery-dl`, ta
 - **One-click workflow:** `run_update.bat` fetches new likes and bookmarks, tags them and pushes them to Hydrus.
 - **Character and series tags:** Camie Tagger v2 (ONNX, DirectML on AMD, Intel and Nvidia GPUs, CPU fallback) with variant folding, so costume tags like `shiroko_(swimsuit)_(blue_archive)` count as `shiroko_(blue_archive)`.
 - **Tweet metadata, not just pixels:** author, hashtags, a "sensitive" flag, the tweet URL, the tweet text as a note, and the post date all go into Hydrus.
+- **Videos and GIFs too:** they can't be tagged by Camie, so they're imported with the tweet metadata only (creator, hashtags, URL, note, date).
 - **Separate tag service:** every automatic tag goes to its own local Hydrus tag service (`camie` by default), so it never mixes with tags you write yourself.
 - **Safe to re-run:** files whose data hasn't changed are skipped, and files you deleted in Hydrus are never re-imported.
 - **Fast re-tagging:** scores are cached in SQLite, and tag thresholds are applied at push time, so changing them needs no rescan.
@@ -26,7 +27,7 @@ gallery-dl  ->  Incoming/Inbox  ->  intake (tag)  ->  push_to_hydrus.py  ->  Hyd
 
 1. **Fetch:** `gallery-dl` saves new images and a `.json` sidecar per image into `Incoming/Inbox`. A download archive (`data/archive.sqlite3`) stops anything being downloaded twice.
 2. **Intake:** sidecars are read (hashtags and author are merged into `data/tweet_hashtags.csv`) and moved to `Meta/`. Every new image is scored by Camie and the scores are cached. Images stay where they are.
-3. **Push:** each image is imported into Hydrus by path, then tagged, linked to its tweet, given a note and a post date.
+3. **Push:** each image is imported into Hydrus by path, then tagged, linked to its tweet, given a note and a post date. Videos and GIFs in the Inbox go in the same way, without Camie tags. Intake warns you if an image couldn't be read, since that image won't be pushed.
 
 Your library lives under `parent_dir`: `Incoming/Inbox` (new downloads) and `Meta/` (processed sidecars).
 
@@ -59,10 +60,13 @@ x-likes-sorter/
 │   └── hashtag_map.csv       # Only used by the legacy sorting commands
 ├── data/                     # Generated: score cache, tweet_hashtags.csv, download archive, push records
 ├── model/                    # Generated: auto-downloaded Camie model and metadata
+├── tests/
+│   └── test_flow.py          # Fake-Hydrus tests for intake and push (touches nothing real)
 ├── .gitignore                # Keeps cookies, config.json, hydrus.json, data/ and model/ out of git
 ├── README.md
 ├── char_sorter.py            # Tagging and sidecar ingestion (plus the legacy sorting code)
 ├── push_to_hydrus.py         # Sends tagged images to Hydrus
+├── export_parents.py         # Lists costume -> character tag parent pairs for Hydrus
 ├── requirements.txt
 ├── run_update.bat            # Menu and command runner
 └── setup.bat                 # One-time installer
@@ -98,6 +102,7 @@ x-likes-sorter/
    - Edit File Tags
    - Edit File Notes
    - Edit File Times
+   - Search for and Fetch Files (optional: only for option 6 / `--resync`)
 4. **Copy `config/hydrus.example.json` to `config/hydrus.json`** and paste the 64-character key into `access_key`. You can set the `HYDRUS_ACCESS_KEY` environment variable instead.
 5. **Test it:** run menu option 4. It prints the key's permissions and confirms the `camie` tag service.
 
@@ -117,10 +122,12 @@ Double-click **`run_update.bat`**:
 
  HYDRUS
   [4] Check Hydrus Connection (key, permissions, tag service)
-  [5] Re-push Everything That Changed (after tag or threshold edits)
+  [5] Re-push Everything That Changed (adds tags only)
+  [6] Re-push And Remove Stale Tags (needs 'Search for and Fetch Files')
+  [7] Export Costume Tag Parents (for Hydrus tag parents)
 
  TOOLS
-  [6] Benchmark GPU / Batch Size
+  [8] Benchmark GPU / Batch Size
 
   [0] Exit
 ```
@@ -128,7 +135,8 @@ Double-click **`run_update.bat`**:
 - **[1]** checks that Hydrus is reachable first (so you don't download for nothing), fetches Likes and Bookmarks (each can be turned off in the config), tags the new images and pushes them. **Open Hydrus before running it.**
 - **[2]** does the tag and push steps for files already in the Inbox, for example after an interrupted run.
 - **[3]** shows what would be sent (counts and a few example payloads) without contacting Hydrus.
-- **[5]** re-pushes every image whose tags, URL, note or date changed since its last push, across the whole cache, not only the Inbox.
+- **[5]** re-pushes every image whose tags, URL, note or date changed since its last push, across the whole cache, not only the Inbox. It only adds tags.
+- **[6]** checks every file (not only changed ones, so it also cleans up after an earlier plain push) and also removes tags the script owns that are no longer wanted (for example a `character:` tag after you raised `character_threshold`). It reads each file's current tags from Hydrus, so it needs one more key permission, **Search for and Fetch Files**. It only touches the `camie` service and only these namespaces: `character:`, `possible character:`, `series:`, `creator:`, `hashtag:` and `x flag:`. Anything else you put in that service is left alone.
 
 ### Running commands without the menu
 
@@ -136,6 +144,8 @@ Double-click **`run_update.bat`**:
 run_update.bat sync       :: the full flow from option 1 (good for Task Scheduler)
 run_update.bat push       :: tag + push the Inbox (option 2)
 run_update.bat check      :: test the Hydrus connection (option 4)
+run_update.bat resync     :: re-push and remove stale tags (option 6)
+run_update.bat parents    :: write the costume tag-parent list (option 7)
 run_update.bat bench      :: any char_sorter.py command
 ```
 
@@ -150,6 +160,7 @@ Or activate the environment (`call venv\Scripts\activate`) and call the scripts 
 | `python push_to_hydrus.py --limit 50` | Push a small batch first. |
 | `python push_to_hydrus.py` | Push everything not yet pushed. |
 | `python push_to_hydrus.py --force` | Re-send even files that look unchanged. |
+| `python push_to_hydrus.py --resync` | Also remove stale script-owned tags from files whose tags changed. |
 | `python push_to_hydrus.py --folder "D:\X_Likes\Incoming\Inbox"` | Only images under one folder. |
 
 ### Importing an existing library
@@ -214,19 +225,24 @@ JSON needs doubled backslashes in Windows paths, no trailing comma after the las
 | `sensitive_tag` | `x flag:sensitive` | Tag for sensitive tweets. Empty = off. |
 | `add_url` / `add_note` / `set_post_date` | `true` | Send the tweet URL, the tweet text note, and the post date. |
 | `note_name` / `date_domain` | `tweet` / `x.com` | Name of the note and domain of the timestamp. |
-| `delete_after_import` | `false` | Hydrus deletes the original file from disk after importing it. See below. |
+| `respect_deleted_tags` | `true` | Don't re-add tags you deleted by hand in Hydrus. |
+| `push_videos` | `true` | Also import videos and GIFs found in the Inbox (metadata only). |
+| `video_extensions` | mp4, webm, mov, m4v, mkv, gif | Which files count as videos. |
+| `delete_after_import` | `false` | Delete the local file after the whole push for it succeeded. See below. |
 | `max_workers` | `24` | Parallel Hydrus API workers (1-24). Lower it if Hydrus becomes sluggish. |
 | `max_consecutive_errors` | `10` | Stop the run after this many failures in a row. |
 
-**Changing thresholds later only adds tags.** A push never removes a tag, so lowering a threshold adds more and raising it leaves the old ones in place. Fix wrong tags in Hydrus itself.
+**Changing thresholds later only adds tags**, unless you use menu option 6 / `--resync`, which also removes tags that are no longer wanted. Option 6 needs the extra key permission described above.
 
-**`delete_after_import`:** Hydrus copies the files it imports, so the Inbox keeps a second copy of every image. Once a small test push looks right in Hydrus, set this to `true` and the Inbox empties itself as you go. The gallery-dl archive prevents re-downloads and `Meta/` keeps the sidecars.
+**`respect_deleted_tags`** (default `true`): a tag you delete by hand from the `camie` service stays deleted, even if a later push would add it again. Set it to `false` if you want pushes to re-add them.
+
+**`delete_after_import`:** Hydrus copies the files it imports, so the Inbox keeps a second copy of every file. Once a small test push looks right in Hydrus, set this to `true` and the Inbox empties itself as you go. The script deletes a file only after every step for it succeeded (import, tags, URL, note and date), and only inside the Inbox, so a failed step leaves the file for the next run to retry. The gallery-dl archive prevents re-downloads and `Meta/` keeps the sidecars.
 
 ---
 
 ## Working in Hydrus
 
-- **Costume variants:** if Camie tags a costume as its own character, merge them with a tag sibling (for example `character:shiroko (swimsuit) (blue archive)` → `character:shiroko (blue archive)`). It applies retroactively to everything already imported.
+- **Costume variants:** Camie names a costume as its own character (`character:kazama iroha (1st costume)`), so searching `character:kazama iroha` misses those images. Make the costume tag a **child** of the plain character with *tags > manage tag parents* (on the `camie` service): a search for the character then finds both, and each image keeps its costume tag. Menu option 7 (`export_parents.py`) writes every costume → character pair found in your scan to `data/tag_parents.txt` (and a readable `data/tag_parents.csv`). Import it from *manage tag parents > import*, and **check in the dialog that the costume tag is on the child side before you apply**. It decides what counts as a costume from `costume_terms` (see `export_parents.py`). Use a tag **sibling** instead only if you want the costume tag to disappear from view.
 - **Characters the tagger doesn't know** (new releases especially): search the `hashtag:` tag for that character, select all, and add the character tag yourself under *my tags*. Your own tags stay separate from the `camie` service.
 - **Review the guesses:** search `possible character:*` to confirm or correct the weaker guesses.
 - **Everything from one artist:** search `creator:<handle>`.
@@ -261,11 +277,13 @@ The folder sorter this project started as is still in `char_sorter.py` (`sort`, 
 | `Hydrus rejected the access key` | Re-copy the key into `config/hydrus.json`, or check the key still exists under *review services > client api*. |
 | `Hydrus has no tag service named "camie"` | Create a local tag service with that name under *manage services*, or set `tag_service_name`. |
 | `The access key lacks '...'` | Add the named permission to the key in Hydrus, then re-run. Files pushed without it aren't marked done, so they're retried. |
+| `N Inbox image(s) could not be read or tagged` | Those downloads are probably corrupt. Delete them and re-download (remove their entries from the gallery-dl archive if needed), or open one to check. They are not pushed. |
 | Files show as "previously deleted" | You deleted them in Hydrus earlier. That's intentional. |
 | 0 images with tags or no tweet data | Check that `Meta/` and `Inbox/` contain the `.json` sidecars, and run `rebuild-tags`. |
 | Warning: unknown config keys | A key is misspelled. Compare it with the example file. |
 | `Failed to read config.json` | The JSON is invalid (single backslashes, trailing comma, comments). |
 | Tagger is slow or scanning stalls | Run `bench` and set `dml_device_id` and `batch_size` (try `1`). |
+| `--resync needs the permission 'Search for and Fetch Files'` | Add that permission to your key under *review services > client api*. |
 | `venv not found` | Run `setup.bat` first. |
 
 ---
@@ -273,3 +291,9 @@ The folder sorter this project started as is still in `char_sorter.py` (`sort`, 
 ## Sharing With Friends
 
 Send the repo. `.gitignore` keeps out your `cookies.txt`, `config/config.json`, `config/hydrus.json` (which holds your API key), `data/` and `model/`, so none of your private data goes along. They run `setup.bat`, add their own `cookies.txt`, edit `config/config.json` and `config/hydrus.json`, and follow the Quick Start above.
+
+---
+
+## Tests
+
+`python tests\test_flow.py` (with the venv active) runs the intake and push logic against a fake Hydrus server in a temporary folder. It never touches your real `config/`, `data/` or library. It checks our logic against Hydrus's documented API, so it can't prove your real Hydrus behaves identically; use `--check` and a small `--limit` push for that.

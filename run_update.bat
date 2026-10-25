@@ -57,10 +57,13 @@ echo   [3] Push Preview (dry run, Hydrus not contacted)
 echo.
 echo  HYDRUS
 echo   [4] Check Hydrus Connection (key, permissions, tag service)
-echo   [5] Re-push Everything That Changed (after tag or threshold edits)
+echo   [5] Re-push Everything That Changed (adds tags only)
+echo   [6] Re-push And Remove Stale Tags (needs 'Search for and Fetch Files')
+echo.
+echo   [7] Export Costume Tag Parents (for Hydrus tag parents)
 echo.
 echo  TOOLS
-echo   [6] Benchmark GPU / Batch Size
+echo   [8] Benchmark GPU / Batch Size
 echo.
 echo   [0] Exit
 echo.
@@ -72,7 +75,9 @@ if "%choice%"=="2" call :do_process & goto finish
 if "%choice%"=="3" python push_to_hydrus.py --dry-run --folder "%INBOX_DIR%" & goto finish
 if "%choice%"=="4" python push_to_hydrus.py --check & goto finish
 if "%choice%"=="5" python push_to_hydrus.py & goto finish
-if "%choice%"=="6" python char_sorter.py bench & goto finish
+if "%choice%"=="6" python push_to_hydrus.py --resync & goto finish
+if "%choice%"=="7" python export_parents.py & goto finish
+if "%choice%"=="8" python char_sorter.py bench & goto finish
 if "%choice%"=="0" exit /b
 goto menu
 
@@ -88,6 +93,8 @@ goto menu
 if /i "%~1"=="sync" goto cli_sync
 if /i "%~1"=="push" goto cli_push
 if /i "%~1"=="check" goto cli_check
+if /i "%~1"=="resync" goto cli_resync
+if /i "%~1"=="parents" goto cli_parents
 python char_sorter.py %*
 exit /b %errorlevel%
 
@@ -101,6 +108,14 @@ exit /b %errorlevel%
 
 :cli_check
 python push_to_hydrus.py --check
+exit /b %errorlevel%
+
+:cli_parents
+python export_parents.py
+exit /b %errorlevel%
+
+:cli_resync
+python push_to_hydrus.py --resync
 exit /b %errorlevel%
 
 :: ---- Subroutine: fetch likes and bookmarks, then tag and push the Inbox ----

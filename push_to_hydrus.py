@@ -13,8 +13,14 @@ For every image in the Camie score cache that still exists on disk, it:
    adds the tweet URL as a known URL,
    stores the tweet text as a note,
    sets the tweet's post date as the file's "modified time" for the domain x.com.
+Videos and GIFs sitting in the Inbox (which Camie can't tag) are imported too, with the tweet metadata only
+(creator, hashtags, URL, note, date). Turn that off with "push_videos": false.
 Safe to re-run: tag, URL and note calls are idempotent, and files whose data has not changed since the last
-push are skipped (data/hydrus_pushed.db). Changing a threshold later only ADDS tags - it never removes the old ones.
+push are skipped (data/hydrus_pushed.db). Changing a threshold later only ADDS tags - it never removes the old ones -
+unless you run with --resync, which also removes tags this script owns (character:, possible character:, series:,
+creator:, hashtag:, x flag:) that are no longer wanted. --resync needs the extra permission "Search for and Fetch
+Files"; it only ever touches the tag service named in the config.
+Tags you deleted by hand in Hydrus are not re-added (see "respect_deleted_tags").
 Setup:  copy config/hydrus.example.json to config/hydrus.json and fill in access_key
         (or set the HYDRUS_ACCESS_KEY environment variable). Add config/hydrus.json to .gitignore.
         In Hydrus: services > manage services > add a Client API service, create a local tag service called
@@ -26,6 +32,7 @@ Usage:
     python push_to_hydrus.py --limit 50              # try a small batch first
     python push_to_hydrus.py                         # everything not yet pushed
     python push_to_hydrus.py --force                 # re-send even files that look unchanged
+    python push_to_hydrus.py --resync                # also remove stale tags from files whose tags changed
     python push_to_hydrus.py --folder "D:/X_Likes/Incoming/Inbox"   # only images under a folder
 """
 import argparse
@@ -67,9 +74,17 @@ DEFAULTS = {
     "note_name": "tweet",
     "set_post_date": True,
     "date_domain": "x.com",
-    "delete_after_import": False,     # True deletes the file from disk once Hydrus has it. Leave off until you trust it.
+    # True = tags you deleted by hand in Hydrus stay deleted (the push acts like a downloader). False = the push
+    # re-adds them whenever it re-sends a file.
+    "respect_deleted_tags": True,
+    "push_videos": True,              # also import videos/GIFs found in the Inbox (metadata only, no Camie tags)
+    "video_extensions": [".mp4", ".webm", ".mov", ".m4v", ".mkv", ".gif"],
+    # True deletes the LOCAL file after the whole push for it succeeded (import, tags, URL, note and date), and only
+    # for files inside the Inbox. If any step failed the file is kept so the next run can retry it. Leave off until
+    # you trust it.
+    "delete_after_import": False,
     "max_consecutive_errors": 10,
-    "max_workers":24,  # conservative concurrent Hydrus API workers
+    "max_workers": 24,                # parallel Hydrus API workers (1-24); lower it if Hydrus gets sluggish
 }
 class Fatal(Exception):
     pass
@@ -216,16 +231,67 @@ def index_sidecars(folders):
 # ------------------------------------------------------------------------------
 def clean(s):
     return re.sub(r"\s+", " ", str(s).replace("_", " ")).strip().lower()
+
+def split_character_costume(name, costume_terms):
+    """Return (canonical character tag, costume name or None).
+
+    Only removes parenthetical segments explicitly recognized as costumes.
+    Preserves other qualifiers, including series names.
+    """
+    terms = {
+        re.sub(r"[\s_]+", "_", str(term).strip().lower())
+        for term in costume_terms
+    }
+
+    matches = list(re.finditer(r"_\(([^()]*)\)", name))
+    costume = None
+
+    for match in matches:
+        variant = re.sub(
+            r"[\s_]+", "_", match.group(1).strip().lower()
+        )
+
+        if variant in terms:
+            costume = variant
+            name = name[:match.start()] + name[match.end():]
+            break
+
+    # Normalize leftover separators after removing the costume segment.
+    canonical = re.sub(r"_+", "_", name).strip("_ ")
+
+    return canonical, costume
+
 def build_item(path, top, series, rec, c):
     base = os.path.basename(path)
     m = cs.TWEET_ID_RE.search(base)
     tid = m.group(1) if m else (rec["tweet_id"] if rec else None)
     tags = set()
+    costume_terms = c.get("costume_terms", [])
+
+    best_char, best_costume = {}, {}
     for name, score in top or []:
+        canonical, costume = split_character_costume(name, costume_terms)
+        canonical = re.sub(
+            r"^(?:possible\s*character|character|possible\s*costume|costume)\s*:",
+            "", canonical, flags=re.IGNORECASE,
+        ).strip()
+        canonical = cs.ALIASES.get(canonical, canonical)
+        who = clean(canonical)
+        best_char[who] = max(score, best_char.get(who, 0.0))
+        if costume:
+            key = who + " - " + clean(costume)
+            best_costume[key] = max(score, best_costume.get(key, 0.0))
+
+    for who, score in best_char.items():
         if score >= c["character_threshold"]:
-            tags.add("character:" + clean(name))
+            tags.add("character:" + who)
         elif score >= c["possible_threshold"]:
-            tags.add("possible character:" + clean(name))
+            tags.add("possible character:" + who)
+    for key, score in best_costume.items():
+        if score >= c["character_threshold"]:
+            tags.add("costume:" + key)
+        elif score >= c["possible_threshold"]:
+            tags.add("possible costume:" + key)
     for name, score in series or []:
         if score >= c["series_threshold"]:
             tags.add("series:" + clean(name))
@@ -274,7 +340,7 @@ def load_items(c, folder=None):
     if folder:
         root = os.path.normcase(os.path.abspath(folder)) + os.sep
     sidecars, n_sidecars = index_sidecars([cs.META_DIR, cs.INBOX_DIR])
-    items, missing = [], 0
+    items, missing, seen = [], 0, set()
     for path, top_json in rows:
         if root and not os.path.normcase(os.path.abspath(path)).startswith(root):
             continue
@@ -285,7 +351,23 @@ def load_items(c, folder=None):
         m = cs.TWEET_ID_RE.search(os.path.basename(path))
         rec = sidecars.get(m.group(1)) if m else None
         items.append(build_item(path, top, series.get(os.path.basename(path)), rec, c))
-    return items, {"sidecars": n_sidecars, "tweets": len(sidecars), "missing": missing}
+        seen.add(os.path.basename(path))
+    n_videos = 0
+    if c["push_videos"]:
+        exts = tuple(("." + e.lstrip(".")).lower() for e in c["video_extensions"])
+        vroot = folder or cs.INBOX_DIR
+        if os.path.isdir(vroot):
+            for r, _, files in os.walk(vroot):
+                for f in sorted(files):
+                    if not f.lower().endswith(exts) or f in seen:
+                        continue
+                    path = os.path.join(r, f)
+                    m = cs.TWEET_ID_RE.search(f)
+                    rec = sidecars.get(m.group(1)) if m else None
+                    items.append(build_item(path, [], None, rec, c))
+                    seen.add(f)
+                    n_videos += 1
+    return items, {"sidecars": n_sidecars, "tweets": len(sidecars), "missing": missing, "videos": n_videos}
 # ------------------------------------------------------------------------------
 # Hydrus Client API
 # ------------------------------------------------------------------------------
@@ -348,33 +430,84 @@ def optional_call(h, feats, feature, label, path, body):
     if r.status_code >= 400:
         return False
     return True
-def push_item(h, service_key, it, c, feats):
-    """Returns (outcome, complete). Raises Fatal for problems that make every file fail."""
+def delete_local_copy(path):
+    """Delete a file that Hydrus now holds. Only ever inside the Inbox, so a wrong config can't touch the library."""
+    root = os.path.normcase(os.path.abspath(cs.INBOX_DIR)) + os.sep
+    full = os.path.normcase(os.path.abspath(path))
+    if not full.startswith(root):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def namespace(tag):
+    return tag.split(":", 1)[0] if ":" in tag else ""
+
+
+def owned_namespaces(c):
+    ns = {"character", "possible character", "series", "costume", "possible costume"}
+    if c["add_creator"]:
+        ns.add("creator")
+    if c["add_hashtags"]:
+        ns.add(c["hashtag_namespace"])
+    if c["sensitive_tag"] and ":" in c["sensitive_tag"]:
+        ns.add(namespace(c["sensitive_tag"]))
+    return ns
+
+
+def stale_tags(h, service_key, sha, wanted, c):
+    """Tags this script owns that the file has in the service now but should not have any more."""
+    r = h.request("GET", "/get_files/file_metadata",
+                  params={"hashes": json.dumps([sha]), "include_services_object": "false"})
+    if r.status_code == 403:
+        raise Fatal("--resync needs the permission 'Search for and Fetch Files' on the access key "
+                    "(services > review services > client api > edit the key).")
+    if r.status_code >= 400:
+        return None
+    meta = (r.json().get("metadata") or [{}])[0]
+    current = (((meta.get("tags") or {}).get(service_key) or {}).get("storage_tags") or {}).get("0") or []
+    own, keep = owned_namespaces(c), set(wanted)
+    return sorted(t for t in current if namespace(t) in own and t not in keep)
+
+
+def push_item(h, service_key, it, c, feats, resync=False):
+    """Returns (outcome, complete, removed). Raises Fatal for problems that make every file fail."""
     body = {"path": os.path.abspath(it["path"])}
-    if c["delete_after_import"]:
-        body["delete_after_successful_import"] = True
     r = h.request("POST", "/add_files/add_file", json=body)
     if r.status_code == 403:
         raise Fatal("The access key lacks 'Import and Delete Files'.")
     if r.status_code >= 400:
-        return "failed", False
+        return "failed", False, 0
     j = r.json()
     status = j.get("status")
     if status == 3:
-        return "previously_deleted", False   # you deleted it from Hydrus before; respect that
+        return "previously_deleted", False, 0   # you deleted it from Hydrus before; respect that
     if status not in (1, 2):
-        return ("vetoed" if status == 7 else "failed"), False
+        return ("vetoed" if status == 7 else "failed"), False, 0
     sha = j.get("hash")
     if not sha:
-        return "failed", False
+        return "failed", False, 0
     complete = True
-    if it["tags"]:
-        r = h.request("POST", "/add_tags/add_tags",
-                      json={"hash": sha, "service_keys_to_tags": {service_key: it["tags"]}})
+    removed = []
+    if resync and status == 2:       # a file imported just now has no old tags to clean up
+        removed = stale_tags(h, service_key, sha, it["tags"], c)
+        if removed is None:
+            return "failed", False, 0
+    if it["tags"] or removed:
+        body = {"hash": sha, "override_previously_deleted_mappings": not c["respect_deleted_tags"]}
+        if removed:
+            body["create_new_deleted_mappings"] = False     # only delete where the tag really is on the file
+            body["service_keys_to_actions_to_tags"] = {service_key: {"0": it["tags"], "1": removed}}
+        else:
+            body["service_keys_to_tags"] = {service_key: it["tags"]}
+        r = h.request("POST", "/add_tags/add_tags", json=body)
         if r.status_code == 403:
             raise Fatal("The access key lacks 'Edit File Tags'.")
         if r.status_code >= 400:
-            return "failed", False
+            return "failed", False, 0
     if it["url"] and c["add_url"]:
         ok = optional_call(h, feats, "url", "'Import and Edit URLs'", "/add_urls/associate_url",
                            {"hash": sha, "url_to_add": it["url"]})
@@ -387,7 +520,7 @@ def push_item(h, service_key, it, c, feats):
         ok = optional_call(h, feats, "time", "'Edit File Times'", "/edit_times/set_time",
                            {"hash": sha, "timestamp": it["ts"], "timestamp_type": 0, "domain": c["date_domain"]})
         complete = complete and ok
-    return ("imported" if status == 1 else "already_in_hydrus"), complete
+    return ("imported" if status == 1 else "already_in_hydrus"), complete, len(removed)
 # ------------------------------------------------------------------------------
 # main
 # ------------------------------------------------------------------------------
@@ -401,6 +534,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="show what would be sent; never contacts Hydrus")
     ap.add_argument("--limit", type=int, default=0, help="push at most N files that need pushing")
     ap.add_argument("--force", action="store_true", help="re-send files even if unchanged since the last push")
+    ap.add_argument("--resync", action="store_true",
+                    help="also remove tags this script owns that are no longer wanted (needs 'Search for and Fetch Files')")
     ap.add_argument("--folder", help="only images under this folder")
     ap.add_argument("--show", type=int, default=3, help="dry-run: how many example payloads to print")
     a = ap.parse_args()
@@ -417,11 +552,12 @@ def main():
         if not a.dry_run:
             service_key = check(h, c)
         items, info = load_items(c, a.folder)
-        print(f"{len(items)} images in the cache exist on disk ({info['missing']} cached files are gone). "
+        print(f"{len(items)} files to consider: {len(items) - info['videos']} tagged images that exist on disk "
+              f"({info['missing']} cached files are gone) and {info['videos']} videos/GIFs. "
               f"Sidecars: {info['sidecars']} files covering {info['tweets']} tweets.")
         con = pushed_db()
         done = dict(con.execute("SELECT name, sig FROM pushed"))
-        todo = [it for it in items if a.force or done.get(it["name"]) != it["sig"]]
+        todo = [it for it in items if a.force or a.resync or done.get(it["name"]) != it["sig"]]
         print(f"{len(items) - len(todo)} unchanged since the last push (skipped), {len(todo)} to push.")
         if a.limit:
             todo = todo[:a.limit]
@@ -460,7 +596,7 @@ def main():
             # requests.Session is kept per worker thread rather than shared between threads.
             if not hasattr(thread_state, "hydrus"):
                 thread_state.hydrus = Hydrus(c["api_url"], c["access_key"])
-            return push_item(thread_state.hydrus, service_key, it, c, feats)
+            return push_item(thread_state.hydrus, service_key, it, c, feats, a.resync)
 
         completed = 0
         # Submit only a small batch at a time so the script can stop cleanly after repeated failures.
@@ -470,13 +606,23 @@ def main():
                 futures = {pool.submit(process_one, it): it for it in batch}
                 for future in as_completed(futures):
                     it = futures[future]
-                    outcome, complete = future.result()
+                    try:
+                        outcome, complete, removed = future.result()
+                    except Fatal:
+                        raise
+                    except Exception as e:   # one odd reply must not kill a long run
+                        outcome, complete, removed = "failed", False, 0
+                        print(f"  error on {it['name']}: {type(e).__name__}: {str(e)[:120]}")
                     completed += 1
                     counts[outcome] += 1
+                    if removed:
+                        counts["stale tags removed"] += removed
                     if outcome in ("imported", "already_in_hydrus"):
                         errors_in_a_row = 0
                         if complete:
                             con.execute("INSERT OR REPLACE INTO pushed VALUES (?,?)", (it["name"], it["sig"]))
+                            if c["delete_after_import"] and delete_local_copy(it["path"]):
+                                counts["local copy deleted"] += 1
                     elif outcome == "failed":
                         errors_in_a_row += 1
                         print(f"  failed: {it['name']}")
@@ -487,7 +633,6 @@ def main():
                         rate = completed / max(time.time() - start, 1e-6)
                         eta = (len(todo) - completed) / rate
                         print(f"{completed}/{len(todo)}  ({rate:.1f}/s, about {eta / 60:.0f} min left; {workers} workers)")
-        con.commit()
         con.commit()
         print("\nDone: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in counts.most_common()))
         if counts["previously_deleted"]:

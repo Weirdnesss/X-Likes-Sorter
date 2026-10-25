@@ -1512,13 +1512,27 @@ def cmd_inbox(dry_run):
                 os.rmdir(root)
 
 def cmd_intake():
-    """No sorting: read sidecars (moved to Meta/), tag every new image in the Inbox, leave the images where they are."""
-    if not list_images(INBOX_DIR):
-        print(f"No new images in {INBOX_DIR}.")
-        return
+    """No sorting: read sidecars (moved to Meta/), tag every new image in the Inbox, leave the files where they are.
+    push_to_hydrus.py then sends them (and any videos/GIFs) to Hydrus."""
     seen = ingest_sidecars([INBOX_DIR], move=True)
-    print(f"Tweet metadata read from {seen} sidecar files.")
+    if seen:
+        print(f"Tweet metadata read from {seen} sidecar files.")
+    if not list_images(INBOX_DIR):
+        print(f"No new images to tag in {INBOX_DIR}.")
+        return
     cmd_scan(INBOX_DIR, quiet=True)
+    # An image the tagger couldn't read (corrupt download, odd format) is skipped by the scan; say so instead of
+    # letting it silently never reach Hydrus.
+    con = db_connect()
+    cached = {r[0] for r in con.execute("SELECT path FROM scores")}
+    con.close()
+    bad = [p for p in list_images(INBOX_DIR) if p not in cached]
+    if bad:
+        print(f"[!] {len(bad)} Inbox image(s) could not be read or tagged, so they will NOT be pushed "
+              f"(corrupt download?). First few:")
+        for p in bad[:5]:
+            print("    " + p)
+
 
 # ==============================================================================
 # UNDO & BENCH
