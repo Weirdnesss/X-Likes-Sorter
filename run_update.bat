@@ -60,7 +60,7 @@ echo   [4] Check Hydrus Connection (key, permissions, tag service)
 echo   [5] Re-push Everything That Changed (adds tags only)
 echo   [6] Re-push And Remove Stale Tags (needs 'Search for and Fetch Files')
 echo.
-echo   [7] Export Costume Tag Parents (for Hydrus tag parents)
+echo   [7] Export Costume Tag and Series Tag Parents (for Hydrus tag parents)
 echo.
 echo  TOOLS
 echo   [8] Benchmark GPU / Batch Size
@@ -76,7 +76,7 @@ if "%choice%"=="3" python push_to_hydrus.py --dry-run --folder "%INBOX_DIR%" & g
 if "%choice%"=="4" python push_to_hydrus.py --check & goto finish
 if "%choice%"=="5" python push_to_hydrus.py & goto finish
 if "%choice%"=="6" python push_to_hydrus.py --resync & goto finish
-if "%choice%"=="7" python export_parents.py & goto finish
+if "%choice%"=="7" python export_parents.py & python export_series_parents.py & goto finish
 if "%choice%"=="8" python char_sorter.py bench & goto finish
 if "%choice%"=="0" exit /b
 goto menu
