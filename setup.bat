@@ -1,9 +1,9 @@
 @echo off
-title X Likes Sorter Setup
+title X Likes To Hydrus Setup
 cd /d "%~dp0"
 
 echo =========================================
-echo     X Likes Sorter - Environment Setup
+echo     X Likes To Hydrus - Environment Setup
 echo =========================================
 echo.
 
@@ -34,15 +34,10 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/4] Creating Project Folders ^& Templates...
+echo [3/4] Creating Project Folders ^& Config Files...
 if not exist "config" mkdir config
 if not exist "data" mkdir data
 if not exist "model" mkdir model
-
-if not exist "config\hashtag_map.csv" (
-    echo hashtag,folder> config\hashtag_map.csv
-    echo Created config\hashtag_map.csv template.
-)
 
 if not exist "config\config.json" (
     if exist "config\config.example.json" (
@@ -53,14 +48,27 @@ if not exist "config\config.json" (
     )
 )
 
+if not exist "config\hydrus.json" (
+    if exist "config\hydrus.example.json" (
+        copy "config\hydrus.example.json" "config\hydrus.json" >nul
+        echo Created config\hydrus.json from hydrus.example.json.
+    ) else (
+        echo [!] config\hydrus.example.json is missing. Re-download the project.
+    )
+)
+
 echo.
 echo [4/4] Done.
 echo ====================================================
 echo Setup complete!
 echo 1. Save your Twitter cookies as "cookies.txt" in this folder.
-echo 2. Edit "config\config.json": set your username and parent_dir
-echo    (parent_dir can be a full path like D:\X_Likes, or a name
-echo    like X_Likes to keep everything next to this folder).
-echo 3. Double-click "run_update.bat" to start syncing.
+echo 2. Edit "config\config.json": set twitter_username, parent_dir
+echo    (a full path like D:\X_Likes, or a name like X_Likes to keep
+echo    everything next to this folder) and "tagger_backend": "camie".
+echo 3. In Hydrus: enable the Client API, create a local tag service
+echo    called "camie", and add an access key (see README.md).
+echo    Paste the key into "config\hydrus.json" as access_key.
+echo 4. Open Hydrus, then double-click "run_update.bat".
+echo    Option 4 tests the Hydrus connection first.
 echo ====================================================
 pause

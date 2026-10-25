@@ -56,15 +56,14 @@ x-likes-sorter/
 │   ├── config.example.json   # Every option with its default (tracked in git)
 │   ├── config.json           # Your settings (created by setup.bat, not tracked)
 │   ├── hydrus.example.json   # Hydrus settings template (tracked in git)
-│   ├── hydrus.json           # Your Hydrus settings and API key (NOT tracked)
-│   └── hashtag_map.csv       # Only used by the legacy sorting commands
+│   └── hydrus.json           # Your Hydrus settings and API key (NOT tracked)
 ├── data/                     # Generated: score cache, tweet_hashtags.csv, download archive, push records
 ├── model/                    # Generated: auto-downloaded Camie model and metadata
 ├── tests/
 │   └── test_flow.py          # Fake-Hydrus tests for intake and push (touches nothing real)
 ├── .gitignore                # Keeps cookies, config.json, hydrus.json, data/ and model/ out of git
 ├── README.md
-├── char_sorter.py            # Tagging and sidecar ingestion (plus the legacy sorting code)
+├── char_sorter.py            # Tagging (Camie / WD14), sidecar ingestion, benchmark
 ├── push_to_hydrus.py         # Sends tagged images to Hydrus
 ├── export_parents.py         # Lists costume -> character tag parent pairs for Hydrus
 ├── requirements.txt
@@ -154,7 +153,9 @@ Or activate the environment (`call venv\Scripts\activate`) and call the scripts 
 | Command | What it does |
 |---|---|
 | `python char_sorter.py intake` | Read sidecars and tag every new image in the Inbox (nothing is moved). |
+| `python char_sorter.py scan [folder]` | Tag the Inbox, or any folder, without reading sidecars. |
 | `python char_sorter.py bench` | Benchmark the tagger. |
+| `python char_sorter.py rebuild-tags [folder-or-csv]` | Rebuild hashtag data from sidecars. |
 | `python push_to_hydrus.py --check` | Test connection, key, permissions and tag service. |
 | `python push_to_hydrus.py --dry-run --limit 5` | Show what would be sent. Never contacts Hydrus. |
 | `python push_to_hydrus.py --limit 50` | Push a small batch first. |
@@ -165,7 +166,7 @@ Or activate the environment (`call venv\Scripts\activate`) and call the scripts 
 
 ### Importing an existing library
 
-If you already have images on disk, scan them once (`python char_sorter.py scan` tags images under the sorted folder; use `--limit` on the push to try 50 first), then run `python push_to_hydrus.py`. The push can take a while on tens of thousands of files, and an interrupted run resumes where it stopped.
+If you already have images on disk, scan them once (`python char_sorter.py scan "<folder>"` tags every image in that folder; then try `python push_to_hydrus.py --folder "<folder>" --limit 50` first), then run `python push_to_hydrus.py`. The push can take a while on tens of thousands of files, and an interrupted run resumes where it stopped.
 
 ---
 
@@ -202,10 +203,9 @@ Only needs the keys you want to change; anything missing uses the default. `conf
 | `io_threads` | `4` | Threads that load images while the GPU works. |
 | `cache_min_score` | `0.10` | Guesses below this aren't cached. Keep it at or below `possible_threshold`. |
 | `image_extensions` | jpg, jpeg, png, webp | File types picked up. |
-| `merge_variants` | `true` | Folds costume and form variants into the base character. |
 | `character_aliases` | `{}` | Merge tags you consider the same character, e.g. `{"trailblazer_(honkai:_star_rail)": "stelle_(honkai:_star_rail)"}`. |
 
-Camie's score thresholds for the Hydrus tags live in `hydrus.json`, not here. `confidence_threshold`, `review_threshold`, `primary_margin` and the other sorting keys only affect the legacy sorting commands.
+Camie's score thresholds for the Hydrus tags live in `hydrus.json`, not here. Options left over from the old folder sorter (`confidence_threshold`, `folder_*`, `artist_folder_min` and so on) are ignored without a warning, so an old `config.json` keeps working.
 
 JSON needs doubled backslashes in Windows paths, no trailing comma after the last entry, and no comments. The file may be UTF-8 with or without a BOM.
 
@@ -261,9 +261,14 @@ Built automatically from the `.json` sidecars `gallery-dl` writes: on each intak
 
 ---
 
-## Legacy Sorting Commands
+## Coming From the Folder Sorter
 
-The folder sorter this project started as is still in `char_sorter.py` (`sort`, `undo`, `inbox`, `tags`, `suggest-map`, `report`, `multiples`, `learn`, `export-hydrus`). It no longer has menu entries and isn't part of the flow above, but it keeps working through `run_update.bat <command>` if you want it. `config/hashtag_map.csv` and the sorting keys in `config.json` only matter for those commands.
+This project used to sort images into character folders. That code is gone; Hydrus does the organizing now. If you're upgrading:
+
+- **`Sorted/`:** your old folders can be deleted once you've checked that everything is in Hydrus. `data/sort_log.csv`, `data/manual_labels.csv` and `config/hashtag_map.csv` are no longer used either.
+- **Removed commands:** `sort`, `undo`, `inbox`, `learn`, `tags`, `report`, `multiples`, `suggest-map` and `export-hydrus`. `intake` replaces `inbox`, and `push_to_hydrus.py` replaces `export-hydrus`.
+- **Old config options** are ignored silently. The score cache (`data/scores_cache_camie.db`) is unchanged and still used.
+- The previous version lives on in git history if you ever need it.
 
 ---
 

@@ -311,6 +311,71 @@ con.commit()
 con.close()
 os.remove("config/costume_terms.json")
 
+# ---------------------------------------------------------------- the real scan loop with a fake model
+clear()
+import numpy as np  # noqa: E402
+
+NT = 50
+
+
+class _In:
+    name = "input"
+    shape = ["b", 3, 512, 512]
+
+
+class FakeSess:
+    def __init__(self):
+        self.calls = []
+
+    def get_inputs(self):
+        return [_In()]
+
+    def get_outputs(self):
+        class O:
+            def __init__(self, name):
+                self.name = name
+        return [O("initial_predictions"), O("refined_predictions"), O("selected_candidates")]
+
+    def run(self, _, feed):
+        x = feed["input"]
+        self.calls.append(x.shape)
+        b = x.shape[0]
+        logits = np.full((b, NT), -8.0, np.float32)
+        logits[:, 5], logits[:, 7], logits[:, 8] = 4.0, 0.0, 3.0   # p = .98, .5, .95
+        return [np.full((b, NT), -9, np.float32), logits, np.zeros((b, 3), np.int64)]   # refined output is index 1
+
+
+fake = FakeSess()
+cs.ensure_files = lambda: None
+cs.load_session = lambda *a, **k: fake
+cs.load_camie_character_tags = lambda: (np.array([5, 7, 9]), np.array(["alpha_(series)", "beta", "gamma"]))
+cs.load_camie_copyright_tags = lambda: (np.array([8]), np.array(["series_x"]))
+cs.SERIES_ON = True
+cs.BATCH_SIZE = 1
+Image.new("RGB", (900, 1600), (10, 200, 30)).save(f"{INBOX}/1830000000000000001_1.jpg")
+Image.new("RGBA", (40, 30), (255, 0, 0, 128)).save(f"{INBOX}/1830000000000000002_1.png")
+open(f"{INBOX}/1830000000000000003_1.png", "wb").write(b"not an image")
+cs.cmd_scan(INBOX)
+con = cs.db_connect()
+rows = {os.path.basename(p_): json.loads(t) for p_, t in con.execute("select path, top from scores")}
+ser = {n: json.loads(t) for n, t in con.execute("select name, top from series_scores")}
+con.close()
+assert set(rows) == {"1830000000000000001_1.jpg", "1830000000000000002_1.png"}, rows      # corrupt file skipped
+for t in rows.values():
+    assert t[0][0] == "alpha_(series)" and abs(t[0][1] - 0.982) < 0.01 and abs(t[1][1] - 0.5) < 0.01, t
+assert all(ser[n][0][0] == "series_x" for n in rows), ser      # (other sections leave their own rows behind)
+n_calls = len(fake.calls)
+cs.cmd_scan(INBOX, quiet=True)
+assert len(fake.calls) == n_calls, "already-cached images must not be scanned again"
+ok("scan: tags images from the refined output, stores series, skips corrupt and cached files")
+for f_ in os.listdir(INBOX):
+    os.remove(os.path.join(INBOX, f_))
+con = cs.db_connect()
+con.execute("delete from scores")
+con.execute("delete from series_scores")
+con.commit()
+con.close()
+
 # ---------------------------------------------------------------- intake
 clear()
 cs.cmd_scan = lambda *a, **k: None                       # no model here; test the logic around it

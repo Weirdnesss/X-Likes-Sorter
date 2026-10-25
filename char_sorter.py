@@ -1,34 +1,16 @@
 """
-char_sorter.py  -  sort images into character folders using a WD14 tagger.
+char_sorter.py  -  tag anime images with a character/series tagger (Camie Tagger v2 or WD14) and cache the scores.
+push_to_hydrus.py then sends the images and tags to Hydrus Network. Nothing is sorted into folders.
 
-Everyday command (PC Direct Sync flow):
-    python char_sorter.py inbox            # tag + sort files sitting in INBOX_DIR
-    python char_sorter.py inbox --dry-run  # preview only
+Everyday command (run_update.bat does this for you):
+    python char_sorter.py intake           # read tweet sidecars, tag every new image in the Inbox (nothing moves)
 
-Setup / maintenance commands:
-    python char_sorter.py bench            # test GPU/CPU speed
-    python char_sorter.py scan             # run the model once, cache scores
-    python char_sorter.py sort --dry-run   # preview folders/counts, moves nothing
-    python char_sorter.py sort             # actually move files (logged)
-    python char_sorter.py undo             # put everything back using the log
-
-Hashtag tools:
+Other commands:
+    python char_sorter.py scan             # tag the Inbox (same scan, without reading sidecars)
+    python char_sorter.py scan <folder>    # tag any folder of images instead
+    python char_sorter.py bench            # test GPU/CPU speed and pick dml_device_id / batch_size
     python char_sorter.py rebuild-tags                 # rebuild data/tweet_hashtags.csv from Meta/ + Inbox/ sidecars
     python char_sorter.py rebuild-tags <folder|.csv>   # ...or from any folder of .json sidecars / an old tweet_hashtags.csv
-    python char_sorter.py tags                         # top hashtags NOT yet in config/hashtag_map.csv
-    python char_sorter.py tags --all --top 100         # include already-mapped ones
-    python char_sorter.py report                       # after `sort --dry-run`: top hashtags/artists in _Unsorted
-    python char_sorter.py multiples                    # which characters appear together in the _Multiple images
-    python char_sorter.py suggest-map                  # learn hashtag -> character rules from your own tagged images
-    python char_sorter.py suggest-map --apply          # ...and append them to config/hashtag_map.csv
-
-Manual sorting:
-    python char_sorter.py learn                        # learn from files you moved by hand (also automatic on sort/inbox)
-
-Hydrus export (tags instead of folders):
-    python char_sorter.py export-hydrus <stage_dir> --limit 300   # copy a random test batch + tag sidecars into stage_dir
-    python char_sorter.py export-hydrus                           # write <image>.txt tag sidecars next to every image
-    python char_sorter.py export-hydrus --clean                   # delete those sidecars again
 """
 import argparse
 import csv
@@ -37,8 +19,6 @@ import os
 import re
 import shutil
 import sqlite3
-import subprocess
-from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -54,6 +34,13 @@ os.chdir(BASE_DIR)  # all relative paths (config/, data/, model/) resolve next t
 CONFIG_FILE = os.path.join("config", "config.json")
 
 def load_config():
+    # Options from the old folder sorter. They no longer do anything; old config files may still contain them.
+    legacy_keys = {
+        "confidence_threshold", "review_threshold", "primary_margin", "min_folder_size", "auto_learn_manual_moves",
+        "series_min_score", "series_margin", "series_folder_min", "series_ignore", "merge_variants",
+        "use_sibling_hints", "use_author_hints", "author_min_tweets", "author_min_share", "artist_folder_min",
+        "folder_unsorted", "folder_multiple", "folder_review", "folder_misc", "folder_artists", "summary_top_folders",
+    }
     default_config = {
         # --- account / paths ---
         "twitter_username": "",
@@ -77,39 +64,15 @@ def load_config():
         "image_extensions": [".jpg", ".jpeg", ".png", ".webp"],
         "model_url": "https://huggingface.co/SmilingWolf/wd-v1-4-convnextv2-tagger-v2/resolve/main/model.onnx",
         "tags_url": "https://huggingface.co/SmilingWolf/wd-v1-4-convnextv2-tagger-v2/resolve/main/selected_tags.csv",
-        # --- sorting thresholds ---
-        "confidence_threshold": 0.35,
-        "review_threshold": 0.20,
-        "primary_margin": 0.25,
-        "min_folder_size": 3,
-        # --- hints for images the tagger could not place ---
-        "auto_learn_manual_moves": True,  # sort/inbox first learn from files you moved by hand into character folders
-        "series_from_copyright": True,  # camie only: unplaced images go to _Series/<name> from its copyright tags
-        "series_min_score": 0.5,     # minimum copyright confidence
-        "series_margin": 0.2,        # skip crossover art when the top two series are closer than this
-        "series_folder_min": 5,      # new copyright-based series folders need this many images
-        "series_ignore": ["original"],  # copyright tags that are not real series; those images use the next fallback
-        "merge_variants": True,      # outfit variants (shiroko_(swimsuit)_(blue_archive)) count as one character
+        # --- tags ---
+        "series_from_copyright": True,  # camie only: also store each image's copyright (series) guesses, pushed as series: tags
         "character_aliases": {},     # {"trailblazer_(honkai:_star_rail)": "stelle_(honkai:_star_rail)"}: tag -> tag you want it merged into
-        "use_sibling_hints": True,   # other images from the same tweet
-        "use_author_hints": True,    # route by what the artist usually draws
-        "author_min_tweets": 3,      # artist needs at least this many tagger-confirmed tweets
-        "author_min_share": 0.8,     # ...and this share of them must be the same character
-        "artist_folder_min": 8,      # leftovers go to <folder_artists>/<handle> if the artist has this many (0 = off)
-        # --- folder names inside Sorted/ (renaming on an existing library moves files on the next sort) ---
-        "folder_unsorted": "_Unsorted",
-        "folder_multiple": "_Multiple",
-        "folder_review": "_Review",
-        "folder_misc": "_Misc Characters",
-        "folder_artists": "_Artists",
-        # --- output ---
-        "summary_top_folders": 25
     }
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                 user_cfg = json.load(f)
-            unknown = sorted(set(user_cfg) - set(default_config))
+            unknown = sorted(set(user_cfg) - set(default_config) - legacy_keys)
             if unknown:
                 print(f"[!] Warning: unknown config keys ignored (typo?): {', '.join(unknown)}")
             default_config.update(user_cfg)
@@ -138,7 +101,6 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 
 # Main output directory paths
 PARENT_DIR = os.path.abspath(os.path.expanduser(cfg["parent_dir"]))
-DEST_DIR = os.path.join(PARENT_DIR, "Sorted")
 PC_PULL_DIR = os.path.join(PARENT_DIR, "Incoming")
 INBOX_DIR = os.path.join(PC_PULL_DIR, "Inbox")
 META_DIR = os.path.join(PARENT_DIR, "Meta")
@@ -165,42 +127,18 @@ else:
     DB_FILE = os.path.join(DATA_DIR, "scores_cache.db")
 
 # Data files
-LOG_FILE = os.path.join(DATA_DIR, "sort_log.csv")
 TWEET_TAGS_FILE = os.path.join(DATA_DIR, "tweet_hashtags.csv")
-HASHTAG_MAP_FILE = os.path.join(CONFIG_DIR, "hashtag_map.csv")
 
 BATCH_SIZE = max(1, int(cfg.get("batch_size", 4)))
 IO_THREADS = max(1, int(cfg["io_threads"]))
 STORE_MIN_PROB = float(cfg["cache_min_score"])
 
 # Sorting threshold parameters from config
-CONFIDENT = float(cfg.get("confidence_threshold", 0.35))
-REVIEW = float(cfg.get("review_threshold", 0.20))
-PRIMARY_MARGIN = float(cfg.get("primary_margin", 0.25))
-MIN_FOLDER_SIZE = int(cfg.get("min_folder_size", 3))
-USE_SIBLINGS = bool(cfg["use_sibling_hints"])
-AUTO_LEARN = bool(cfg["auto_learn_manual_moves"])
 SERIES_ON = bool(cfg["series_from_copyright"]) and TAGGER_BACKEND == "camie"
-SERIES_MIN_SCORE = float(cfg["series_min_score"])
-SERIES_MARGIN = float(cfg["series_margin"])
-SERIES_FOLDER_MIN = int(cfg["series_folder_min"])
-SERIES_IGNORE = {str(x).strip().lower() for x in cfg["series_ignore"]}
-MERGE_VARIANTS = bool(cfg["merge_variants"])
 ALIASES = {str(k).strip().lower(): str(v).strip().lower() for k, v in (cfg.get("character_aliases") or {}).items()}
 DML_DEVICE = cfg.get("dml_device_id")
-USE_AUTHOR_HINTS = bool(cfg.get("use_author_hints", True))
-AUTHOR_MIN = int(cfg.get("author_min_tweets", 3))
-AUTHOR_SHARE = float(cfg.get("author_min_share", 0.8))
-ARTIST_MIN = int(cfg.get("artist_folder_min", 8))
 
 VALID_EXT = tuple(("." + e.lstrip(".")).lower() for e in cfg["image_extensions"])
-FOLDER_UNSORTED = str(cfg["folder_unsorted"])
-FOLDER_MULTIPLE = str(cfg["folder_multiple"])
-FOLDER_REVIEW = str(cfg["folder_review"])
-FOLDER_MISC = str(cfg["folder_misc"])
-FOLDER_ARTISTS = str(cfg["folder_artists"])
-SUMMARY_TOP = max(1, int(cfg["summary_top_folders"]))
-INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 # ==============================================================================
@@ -416,7 +354,7 @@ def db_connect():
 
 def list_images(folder=None):
     out = []
-    search_root = folder or DEST_DIR
+    search_root = folder or INBOX_DIR
     if os.path.exists(search_root):
         for root, _, files in os.walk(search_root):
             for f in files:
@@ -486,22 +424,14 @@ def cmd_scan(folder=None, quiet=False):
 
     con = db_connect()
     done = {r[0]: (r[1], r[2]) for r in con.execute("SELECT path,size,mtime FROM scores")}
-    have_series = {r[0] for r in con.execute("SELECT name FROM series_scores")} if series_on else set()
-    tops = {r[0]: r[1] for r in con.execute("SELECT path,top FROM scores")} if series_on else {}
 
-    todo, n_backfill = [], 0
+    todo = []
     for p in list_images(folder):
         st = os.stat(p)
         if done.get(p) != (st.st_size, st.st_mtime):
             todo.append(p)
-        elif (series_on and os.path.basename(p) not in have_series
-              and decide(json.loads(tops.get(p) or "[]"))[0] != "char"):
-            # cached before series scores existed, and the tagger couldn't place it: rescan to get its series
-            todo.append(p)
-            n_backfill += 1
     if not quiet or todo:
-        extra = f", {n_backfill} of them rescanned for series" if n_backfill else ""
-        print(f"{len(todo)} images to scan ({len(done)} already cached{extra}).")
+        print(f"{len(todo)} images to scan ({len(done)} already cached).")
     if not todo:
         return
 
@@ -566,108 +496,12 @@ def cmd_scan(folder=None, quiet=False):
 
     con.close()
     if not quiet:
-        print("Scan complete. Now run:  python char_sorter.py sort --dry-run")
+        print("Scan complete. Now run:  python push_to_hydrus.py")
 
 
 # ==============================================================================
-# SORTING LOGIC
+# SMALL HELPERS
 # ==============================================================================
-def split_tag(raw):
-    m = re.search(r"\((.*?)\)\s*$", raw)
-    base = re.sub(r"\s*\(.*?\)\s*$", "", raw)
-    series = m.group(1) if m else ""
-    return base, series
-
-
-def pretty(s):
-    return s.replace("_", " ").title().strip()
-
-
-_PAREN = re.compile(r"\(([^()]*)\)")
-
-
-def character_key(tag):
-    """('shiroko', 'blue_archive') for shiroko_(blue_archive) and shiroko_(swimsuit)_(blue_archive) alike."""
-    groups = _PAREN.findall(tag)
-    base = re.sub(r"_+", "_", _PAREN.sub("", tag)).strip("_ ")
-    return base, (groups[-1] if groups else "")
-
-
-KNOWN_TAGS = set()
-
-
-def set_known_tags(rows):
-    """Remember every character tag the tagger has confidently seen in this library."""
-    KNOWN_TAGS.clear()
-    for _, top in rows:
-        for tag, sc in top:
-            if sc >= CONFIDENT:
-                KNOWN_TAGS.add(tag)
-
-
-def canonical_tag(tag):
-    """Apply your character_aliases, then fold a costume variant (ouro_kronii_(1st_costume)) into its plain
-    tag (ouro_kronii) when that plain tag has been seen in this library."""
-    tag = ALIASES.get(tag, tag)
-    if MERGE_VARIANTS and tag.endswith(")") and "_(" in tag:
-        plain = tag[:tag.rindex("_(")]
-        if plain in KNOWN_TAGS:
-            return plain
-    return tag
-
-
-def merge_variants(top):
-    """Collapse variants of one character into a single guess (best score, plain tag name)."""
-    if not top or not (MERGE_VARIANTS or ALIASES):
-        return top
-    best = {}
-    for tag, sc in top:
-        t = canonical_tag(tag)
-        best[t] = max(best.get(t, 0.0), sc)
-    if not MERGE_VARIANTS:
-        return sorted(([t, sc] for t, sc in best.items()), key=lambda x: -x[1])
-    # costume variant next to its plain tag in the same image (sakamata_chloe + sakamata_chloe_(1st_costume))
-    for t in list(best):
-        for o in list(best):
-            if o != t and t in best and o in best and t.endswith(")") and t.startswith(o + "_("):
-                best[o] = max(best[o], best.pop(t))
-                break
-    # series-style variants (shiroko_(swimsuit)_(blue_archive) next to shiroko_(blue_archive))
-    groups = {}
-    for tag, sc in best.items():
-        key = character_key(tag)
-        g = groups.get(key)
-        if g is None:
-            groups[key] = [tag, sc, tag.count("(")]
-        else:
-            g[1] = max(g[1], sc)
-            if tag.count("(") < g[2]:
-                g[0], g[2] = tag, tag.count("(")
-    merged = []
-    for (base, series), (tag, sc, depth) in groups.items():
-        if depth > 1:  # only costume variants were seen: rebuild the plain character name
-            tag = f"{base}_({series})" if series else base
-        merged.append([tag, sc])
-    merged.sort(key=lambda x: -x[1])
-    return merged
-
-
-def decide(top):
-    top = merge_variants(top)
-    present = [t for t in top if t[1] >= CONFIDENT]
-    if len(present) == 1:
-        return "char", present[0][0]
-    if len(present) > 1:
-        if PRIMARY_MARGIN is not None and present[0][1] - present[1][1] >= PRIMARY_MARGIN:
-            return "char", present[0][0]
-        return "multiple", None
-    if top and top[0][1] >= REVIEW:
-        return "review", top[0][0]
-    return "unsorted", None
-
-
-def safe(name):
-    return INVALID_CHARS.sub("", name).strip(" .") or "Unknown"
 
 
 def unique_path(folder, filename):
@@ -684,434 +518,8 @@ def unique_path(folder, filename):
 TWEET_ID_RE = re.compile(r"(?<!\d)(\d{15,20})(?!\d)")
 
 
-def norm_key(s):
-    return re.sub(r"[\W_]+", "", s.lower())
-
-
-def to_path(name):
-    return os.path.join(*[safe(p) for p in name.replace("\\", "/").split("/") if p])
-
-
-def is_series(name):
-    return name.replace("\\", "/").split("/")[0].lower() == "_series"
-
-
-def load_hashtag_map():
-    if not os.path.exists(HASHTAG_MAP_FILE):
-        return {}
-    out = {}
-    with open(HASHTAG_MAP_FILE, newline="", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            tag = (row.get("hashtag") or "").strip().lstrip("#").lower()
-            folder = (row.get("folder") or "").strip()
-            if tag and folder:
-                out[tag] = folder
-    return out
-
-
-def load_tweet_tags():
-    if not os.path.exists(TWEET_TAGS_FILE):
-        return {}
-    out = {}
-    with open(TWEET_TAGS_FILE, newline="", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            tid = (row.get("tweet_id") or "").strip()
-            if tid:
-                out[tid] = set((row.get("hashtags") or "").split())
-    return out
-
-
-def load_series_scores(con):
-    """filename -> [[copyright_tag, score], ...] (best first), stored by a Camie scan."""
-    return {name: json.loads(top or "[]") for name, top in con.execute("SELECT name, top FROM series_scores")}
-
-
-def series_guess(guesses):
-    """Pick one series folder name from an image's copyright guesses, or None when unsure."""
-    cands = [(t, sc) for t, sc in (guesses or [])
-             if sc >= SERIES_MIN_SCORE and t.lower() not in SERIES_IGNORE]
-    tags = [t for t, _ in cands]
-    # collapse sub-series: blue_archive_the_animation -> blue_archive
-    cands = [(t, sc) for t, sc in cands if not any(t != o and t.startswith(o + "_") for o in tags)]
-    if not cands:
-        return None
-    cands.sort(key=lambda x: -x[1])
-    if len(cands) > 1 and cands[0][1] - cands[1][1] < SERIES_MARGIN:
-        return None  # crossover art: the top two series are too close
-    return safe(re.sub(r"\s*\(series\)\s*$", "", pretty(cands[0][0]), flags=re.I))
-
-
-def load_tweet_authors():
-    """tweet_id -> author (lowercase) from data/tweet_hashtags.csv."""
-    if not os.path.exists(TWEET_TAGS_FILE):
-        return {}
-    out = {}
-    with open(TWEET_TAGS_FILE, newline="", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            tid = (row.get("tweet_id") or "").strip()
-            a = (row.get("author") or "").strip().lower()
-            if tid and a:
-                out[tid] = a
-    return out
-
-
 # ==============================================================================
-# MANUAL SORTING: learn from files you moved by hand
-# ==============================================================================
-LABELS_FILE = os.path.join(DATA_DIR, "manual_labels.csv")
-
-
-def load_labels():
-    """filename -> folder (relative to Sorted/, '/' separated) for images you sorted by hand."""
-    out = {}
-    if os.path.exists(LABELS_FILE):
-        with open(LABELS_FILE, newline="", encoding="utf-8-sig") as f:
-            for r in csv.DictReader(f):
-                name, label = (r.get("file") or "").strip(), (r.get("label") or "").strip()
-                if name and label:
-                    out[name] = label
-    return out
-
-
-def save_labels(labels):
-    with open(LABELS_FILE, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["file", "label"])
-        for name in sorted(labels):
-            w.writerow([name, labels[name]])
-
-
-def rel_under_sorted(path):
-    """Path below the last 'Sorted' folder in an old cached path, lowercase and '/' separated."""
-    parts = os.path.normpath(path).split(os.sep)
-    for i in range(len(parts) - 1, -1, -1):
-        if parts[i].lower() == "sorted":
-            return "/".join(parts[i + 1:]).lower()
-    return None
-
-
-def label_for(new_path):
-    """The character folder an image now sits in, or None for root/automatic (_...) folders."""
-    rel = os.path.relpath(os.path.dirname(new_path), DEST_DIR).replace("\\", "/")
-    if rel == "." or rel.startswith(".."):
-        return None
-    if rel.split("/")[0].startswith("_"):
-        return None
-    return rel
-
-
-def find_manual_moves(db_paths):
-    """Cached files that no longer exist at their cached path but turn up exactly once elsewhere in Sorted/.
-    Returns ({old_path: new_path}, number_of_ambiguous_files). The script updates the cache whenever it
-    moves a file itself, so these are files you moved by hand (or a relocated library)."""
-    missing = [p for p in db_paths if not os.path.exists(p)]
-    if not missing:
-        return {}, 0
-    wanted = {os.path.basename(p) for p in missing}
-    found = defaultdict(list)
-    for q in list_images(DEST_DIR):
-        b = os.path.basename(q)
-        if b in wanted:
-            found[b].append(q)
-    moves, ambiguous = {}, 0
-    for p in missing:
-        hits = found.get(os.path.basename(p), [])
-        if len(hits) == 1:
-            moves[p] = hits[0]
-        elif len(hits) > 1:
-            ambiguous += 1
-    return moves, ambiguous
-
-
-def apply_manual_moves(con, moves, labels, persist):
-    """Turn moves into labels (mutates `labels`). With persist=True also repoints the score cache and
-    saves data/manual_labels.csv; with persist=False it is a preview only."""
-    stats, per_label = Counter(), Counter()
-    for old, new in moves.items():
-        name = os.path.basename(new)
-        rel_new = os.path.relpath(new, DEST_DIR).replace("\\", "/").lower()
-        if rel_under_sorted(old) == rel_new:      # same place under Sorted/: the library was just relocated
-            stats["relocated"] += 1
-        else:
-            label = label_for(new)
-            if label:
-                labels[name] = label
-                stats["labeled"] += 1
-                per_label[label] += 1
-            elif name in labels:
-                del labels[name]
-                stats["unlabeled"] += 1
-            else:
-                stats["automatic"] += 1           # moved into an automatic folder: nothing to learn
-        if persist:
-            if con.execute("SELECT 1 FROM scores WHERE path=?", (new,)).fetchone():
-                con.execute("DELETE FROM scores WHERE path=?", (old,))
-            else:
-                con.execute("UPDATE scores SET path=? WHERE path=?", (new, old))
-    if persist:
-        con.commit()
-        save_labels(labels)
-    return stats, per_label
-
-
-def load_rows_with_labels(con, persist, detect=True):
-    """Cached (path, top) rows for files that exist, plus manual labels. Detects files moved by hand first;
-    persist=False previews that (dry runs) without writing anything."""
-    all_rows = [(p, json.loads(t)) for p, t in con.execute("SELECT path, top FROM scores")]
-    set_known_tags(all_rows)
-    labels = load_labels()
-    if detect:
-        moves, ambiguous = find_manual_moves([p for p, _ in all_rows])
-        if moves:
-            stats, per_label = apply_manual_moves(con, moves, labels, persist)
-            all_rows = [(moves.get(p, p), t) for p, t in all_rows]
-            parts = []
-            if stats["labeled"]:
-                parts.append(f"{stats['labeled']} sorted by hand into {len(per_label)} folders")
-            if stats["unlabeled"]:
-                parts.append(f"{stats['unlabeled']} moved back to automatic folders (label removed)")
-            if stats["automatic"]:
-                parts.append(f"{stats['automatic']} moved between automatic folders")
-            if stats["relocated"]:
-                parts.append(f"{stats['relocated']} relocated with the library (no label)")
-            print("Detected moved files: " + ", ".join(parts)
-                  + ("" if persist else " [preview: saved by the next real sort or `learn`]"))
-            if per_label:
-                print("  Top manual folders: " + ", ".join(f"{l} {n}" for l, n in per_label.most_common(5)))
-        if ambiguous:
-            print(f"  [!] {ambiguous} moved files have duplicate filenames elsewhere in Sorted/ and were skipped.")
-    rows = [(p, t) for p, t in all_rows if os.path.exists(p)]
-    return rows, labels
-
-
-def cmd_learn():
-    """Learn from files moved by hand: label them by their folder, repoint the score cache, save the labels."""
-    con = db_connect()
-    rows, labels = load_rows_with_labels(con, persist=True)
-    present = sum(1 for p, _ in rows if os.path.basename(p) in labels)
-    print(f"Manual labels: {len(labels)} saved ({present} on images currently in the library) -> {LABELS_FILE}")
-    for label, n in Counter(labels.values()).most_common(10):
-        print(f"  {n:5d}  {label}")
-    print("Labeled images stay in their folder on every sort, and count as evidence for author hints, "
-          "same-tweet siblings, hashtag suggestions and folder sizes.")
-
-
-def cmd_sort(dry_run, only_under=None):
-    con = db_connect()
-    rows, labels = load_rows_with_labels(con, persist=not dry_run, detect=AUTO_LEARN)
-    series_scores = load_series_scores(con) if SERIES_ON else {}
-    if not rows:
-        print("Nothing to sort. Run `scan` first.")
-        return
-
-    base = [(p, *decide(t)) for p, t in rows]
-    pinned_n = sum(1 for p, _, _ in base if os.path.basename(p) in labels)
-    if pinned_n:
-        print(f"Manual labels: {pinned_n} images stay in the folders you put them in.")
-
-    bases = defaultdict(set)
-    for _, kind, raw in base:
-        if kind in ("char", "review"):
-            bases[pretty(split_tag(raw)[0])].add(raw)
-
-    def folder_name(raw):
-        b, series = split_tag(raw)
-        name = pretty(b)
-        if len(bases[name]) > 1 and series:
-            name = f"{name} ({pretty(series)})"
-        return safe(name)
-
-    hmap = load_hashtag_map()
-    ttags = load_tweet_tags()
-    print(f"Hashtag rules: {len(hmap)}, tweets with hashtag data: {len(ttags)}")
-    if not ttags:
-        print("[!] No hashtag data found. Run `python char_sorter.py rebuild-tags` to recover it from saved sidecars.")
-
-    canon = {}
-    tweet_chars = defaultdict(set)
-    for p, kind, raw in base:
-        label = labels.get(os.path.basename(p))
-        if kind in ("char", "review"):
-            canon.setdefault(norm_key(folder_name(raw)), folder_name(raw))
-        if label:
-            canon.setdefault(norm_key(label), label)
-        m = TWEET_ID_RE.search(os.path.basename(p))
-        if label and m:
-            tweet_chars[m.group(1)].add(label)       # your label beats the tagger's guess
-        elif kind == "char" and m:
-            tweet_chars[m.group(1)].add(folder_name(raw))
-
-    def canonical(name):
-        if name.startswith("_"):
-            return name
-        return canon.get(norm_key(name), name)
-
-    # Author hints: learn what each artist usually draws, using ONLY tagger-confirmed
-    # images (counted per distinct tweet), so hashtag/sibling placements never feed back in.
-    authors = load_tweet_authors()
-    author_votes = defaultdict(lambda: defaultdict(set))
-    for p, kind, raw in base:
-        label = labels.get(os.path.basename(p))
-        if kind == "char" or label:
-            m = TWEET_ID_RE.search(os.path.basename(p))
-            a = authors.get(m.group(1)) if m else None
-            if a:
-                author_votes[a][label or folder_name(raw)].add(m.group(1))
-    author_rule = {}
-    if USE_AUTHOR_HINTS:
-        for a, votes in author_votes.items():
-            total = sum(len(t) for t in votes.values())
-            top, tids = max(votes.items(), key=lambda kv: len(kv[1]))
-            if total >= AUTHOR_MIN and len(tids) / total >= AUTHOR_SHARE:
-                author_rule[a] = top
-        print(f"Author hints: {len(author_rule)} artists with a clear main character "
-              f"(>= {AUTHOR_MIN} tweets, >= {AUTHOR_SHARE:.0%} same character)")
-        enough = sum(1 for v in author_votes.values() if sum(len(t) for t in v.values()) >= AUTHOR_MIN)
-        print(f"  Author known for {len(authors)} tweets; {len(author_votes)} artists have tagger-confirmed "
-              f"images, {enough} of them with >= {AUTHOR_MIN} tweets.")
-
-    plan_items = []
-    for p, kind, raw in base:
-        forced, src = None, ""
-        pinned = labels.get(os.path.basename(p))
-        if pinned:
-            plan_items.append((p, kind, raw, pinned, "manual"))
-            continue
-        if kind != "char":
-            m = TWEET_ID_RE.search(os.path.basename(p))
-            tid = m.group(1) if m else None
-            tags = ttags.get(tid, set()) if tid else set()
-            folders = {hmap[t] for t in tags if t in hmap}
-            char_f = {f for f in folders if not is_series(f)}
-            series_f = {f for f in folders if is_series(f)}
-            if len(char_f) == 1:
-                forced, src = canonical(next(iter(char_f))), "hashtag"
-            elif len(char_f) == 0:
-                sib = tweet_chars.get(tid, set()) if tid else set()
-                if USE_SIBLINGS and kind in ("review", "unsorted") and len(sib) == 1:
-                    forced, src = next(iter(sib)), "sibling"
-                elif len(series_f) == 1:
-                    forced, src = next(iter(series_f)), "series"
-            if not forced and len(char_f) < 2 and kind in ("review", "unsorted") and tid:
-                hint = author_rule.get(authors.get(tid, ""))
-                if hint:
-                    forced, src = hint, "author"
-            if not forced and len(char_f) < 2 and kind in ("review", "unsorted") and series_scores:
-                guess = series_guess(series_scores.get(os.path.basename(p)))
-                if guess:
-                    forced, src = "_Series/" + guess, "copyright"
-        plan_items.append((p, kind, raw, forced, src))
-
-    if series_scores:
-        # keep a copyright-based series folder only if it is big enough, already exists, or hashtags already use it
-        wanted = Counter(f for _, _, _, f, sr in plan_items if sr == "copyright")
-        known = {f for _, _, _, f, sr in plan_items if sr == "series"}
-        keep = {f for f, n in wanted.items()
-                if n >= SERIES_FOLDER_MIN or f in known or os.path.isdir(os.path.join(DEST_DIR, to_path(f)))}
-        plan_items = [(p, k, r, None, "") if (sr == "copyright" and f not in keep) else (p, k, r, f, sr)
-                      for p, k, r, f, sr in plan_items]
-        if wanted:
-            print(f"Series from copyright tags: {sum(n for f, n in wanted.items() if f in keep)} images into "
-                  f"{len(keep)} series folders ({len(wanted) - len(keep)} small ones skipped)")
-
-    # Last fallback: still-unsorted images grouped by artist (only artists with enough of them)
-    artist_counts = Counter()
-    if ARTIST_MIN > 0:
-        for p, kind, raw, forced, src in plan_items:
-            if not forced and kind == "unsorted":
-                m = TWEET_ID_RE.search(os.path.basename(p))
-                a = authors.get(m.group(1)) if m else None
-                if a:
-                    artist_counts[a] += 1
-        qualifying = {a: n for a, n in artist_counts.items() if n >= ARTIST_MIN}
-        print(f"Artist folders: {len(qualifying)} artists with >= {ARTIST_MIN} unsorted images "
-              f"({sum(qualifying.values())} images)")
-
-    counts = Counter()
-    for p, kind, raw, forced, src in plan_items:
-        if forced and not forced.startswith("_"):
-            counts[forced] += 1
-        elif kind == "char":
-            counts[folder_name(raw)] += 1
-
-    plan = []
-    src_counts = Counter()
-    manual_folders = set(labels.values())   # folders you created by hand are never demoted to _Misc
-    for p, kind, raw, forced, src in plan_items:
-        if forced:
-            if src == "manual" or forced in manual_folders:
-                folder = to_path(forced)
-            elif forced.startswith("_"):
-                folder = to_path(forced)
-            else:
-                folder = forced if counts[forced] >= MIN_FOLDER_SIZE else FOLDER_MISC
-            src_counts[src] += 1
-        elif kind == "char":
-            name = folder_name(raw)
-            folder = name if counts[name] >= MIN_FOLDER_SIZE else FOLDER_MISC
-        elif kind == "review":
-            folder = os.path.join(FOLDER_REVIEW, folder_name(raw))
-        elif kind == "multiple":
-            folder = FOLDER_MULTIPLE
-        else:
-            folder = FOLDER_UNSORTED
-            if ARTIST_MIN > 0:
-                m = TWEET_ID_RE.search(os.path.basename(p))
-                a = authors.get(m.group(1)) if m else None
-                if a and artist_counts[a] >= ARTIST_MIN:
-                    folder = os.path.join(FOLDER_ARTISTS, safe(a))
-                    src = "artist"
-                    src_counts[src] += 1
-        plan.append((p, folder, src))
-
-    if only_under:
-        root = os.path.normcase(os.path.abspath(only_under)) + os.sep
-        plan = [x for x in plan if os.path.normcase(os.path.abspath(x[0])).startswith(root)]
-        src_counts = Counter(src for _, _, src in plan if src)
-
-    summary = Counter(f for _, f, _ in plan)
-    print(f"\n{len(plan)} images -> {len(summary)} folders. Top {SUMMARY_TOP}:")
-    for f, n in summary.most_common(SUMMARY_TOP):
-        print(f"  {n:6d}  {f}")
-    if src_counts:
-        print("\nPlaced using tweet evidence instead of the tagger:")
-        for k, n in src_counts.most_common():
-            print(f"  {n:6d}  by {k}")
-
-    if dry_run:
-        f, preview_name = open_preview_file()
-        with f:
-            w = csv.writer(f)
-            w.writerow(["file", "folder", "source"])
-            w.writerows(plan)
-        print(f"\nDry run only. Full plan written to {preview_name}. Nothing moved.")
-        return
-
-    os.makedirs(DEST_DIR, exist_ok=True)
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as lf:
-        log = csv.writer(lf)
-        moved = 0
-        for i, (p, folder, _) in enumerate(plan, 1):
-            target = os.path.join(DEST_DIR, folder)
-            same = os.path.normcase(os.path.abspath(os.path.dirname(p))) == os.path.normcase(os.path.abspath(target))
-            if not same:
-                os.makedirs(target, exist_ok=True)
-                dest = unique_path(target, os.path.basename(p))
-                shutil.move(p, dest)
-                log.writerow([p, dest])
-                con.execute("UPDATE scores SET path=? WHERE path=?", (dest, p))
-                moved += 1
-            if i % 200 == 0:
-                lf.flush()
-                con.commit()
-                print(f"Moved {i}/{len(plan)}")
-    con.commit()
-    con.close()
-    print(f"\nDone. Moved {moved} files. Undo log: {LOG_FILE}")
-
-
-# ==============================================================================
-# INGEST SIDECARS & INBOX PROCESSING
+# INGEST SIDECARS & INTAKE
 # ==============================================================================
 HASHTAG_IN_TEXT = re.compile(r"#(\w+)")
 
@@ -1224,293 +632,6 @@ def cmd_rebuild_tags(paths):
     print(f"Tweets with hashtag data: {len(load_tag_data())}  ({TWEET_TAGS_FILE})")
 
 
-def cmd_suggest_map(min_tweets=5, min_share=0.8, apply=False):
-    """Suggest hashtag -> character rules from tweets whose image the tagger already identified.
-    A hashtag qualifies if, over tweets showing exactly one tagger-confirmed character, it points to the
-    same character at least `min_share` of the time, on >= `min_tweets` tweets from >= 3 different artists."""
-    con = db_connect()
-    rows, labels = load_rows_with_labels(con, persist=False, detect=AUTO_LEARN)
-    ttags = load_tweet_tags()
-    if not rows or not ttags:
-        print("Need scanned images and hashtag data first (`scan`, and `rebuild-tags` if needed).")
-        return
-    base = [(p, *decide(t)) for p, t in rows]
-    bases = defaultdict(set)
-    for _, kind, raw in base:
-        if kind in ("char", "review"):
-            bases[pretty(split_tag(raw)[0])].add(raw)
-
-    def folder_name(raw):
-        b, series = split_tag(raw)
-        name = pretty(b)
-        if len(bases[name]) > 1 and series:
-            name = f"{name} ({pretty(series)})"
-        return safe(name)
-
-    authors = load_tweet_authors()
-    hmap = load_hashtag_map()
-    tweet_chars = defaultdict(set)
-    for p, kind, raw in base:
-        label = labels.get(os.path.basename(p))
-        m = TWEET_ID_RE.search(os.path.basename(p))
-        if label and m:
-            tweet_chars[m.group(1)].add(label)       # your label beats the tagger's guess
-        elif kind == "char" and m:
-            tweet_chars[m.group(1)].add(folder_name(raw))
-
-    votes = defaultdict(lambda: defaultdict(set))  # hashtag -> character -> tweet ids
-    for tid, chars in tweet_chars.items():
-        if len(chars) != 1:
-            continue
-        char = next(iter(chars))
-        for tag in ttags.get(tid, ()):
-            if tag not in hmap:
-                votes[tag][char].add(tid)
-
-    found = []
-    for tag, per_char in votes.items():
-        total = sum(len(t) for t in per_char.values())
-        char, tids = max(per_char.items(), key=lambda kv: len(kv[1]))
-        n_artists = len({authors[t] for t in tids if t in authors})
-        if total >= min_tweets and len(tids) / total >= min_share and n_artists >= 3:
-            found.append((tag, char, len(tids), len(tids) / total, n_artists))
-    found.sort(key=lambda r: (-r[2], r[0]))
-
-    out_file = os.path.join(CONFIG_DIR, "hashtag_map_suggested.csv")
-    with open(out_file, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["hashtag", "folder", "tweets", "share", "artists"])
-        for tag, char, n, share, na in found:
-            w.writerow([tag, char, n, f"{share:.2f}", na])
-    print(f"{len(found)} suggested rules (>= {min_tweets} tweets, >= {min_share:.0%} same character, >= 3 artists).")
-    for tag, char, n, share, na in found[:40]:
-        print(f"{n:5d}  {share:4.0%}  {tag}  ->  {char}")
-    if len(found) > 40:
-        print(f"  ... and {len(found) - 40} more in {out_file}")
-    if not found:
-        return
-    if apply:
-        new_file = not os.path.exists(HASHTAG_MAP_FILE) or os.path.getsize(HASHTAG_MAP_FILE) == 0
-        needs_nl = False
-        if not new_file:
-            with open(HASHTAG_MAP_FILE, "rb") as fb:
-                fb.seek(-1, os.SEEK_END)
-                needs_nl = fb.read(1) not in (b"\n", b"\r")
-        with open(HASHTAG_MAP_FILE, "a", newline="", encoding="utf-8") as f:
-            if new_file:
-                f.write("hashtag,folder\n")
-            elif needs_nl:
-                f.write("\n")
-            w = csv.writer(f, lineterminator="\n")
-            for tag, char, *_ in found:
-                w.writerow([tag, char])
-        print(f"Appended {len(found)} rules to {HASHTAG_MAP_FILE}. Re-run `sort --dry-run` to see the effect.")
-    else:
-        print(f"Review {out_file}, then copy the rows you want into {HASHTAG_MAP_FILE} (or re-run with --apply for all).")
-
-
-def open_preview_file():
-    """Open sort_preview.csv for writing. If another program (usually Excel) has it open, Windows refuses,
-    so fall back to sort_preview_1.csv, sort_preview_2.csv, ..."""
-    for i in range(20):
-        name = "sort_preview.csv" if i == 0 else f"sort_preview_{i}.csv"
-        try:
-            f = open(name, "w", newline="", encoding="utf-8")
-        except PermissionError:
-            continue
-        if i:
-            print(f"[!] sort_preview.csv is open in another program (Excel?), so the plan was written to {name}.")
-        return f, name
-    raise PermissionError("Could not write sort_preview.csv. Close it in Excel (or any other program) and run again.")
-
-
-def latest_preview_file():
-    """The most recently written sort_preview*.csv, or None."""
-    import glob
-    files = glob.glob("sort_preview*.csv")
-    return max(files, key=os.path.getmtime) if files else None
-
-
-def cmd_report(top=30):
-    """Use the last `sort --dry-run` plan to show what the still-unsorted images have in common."""
-    preview = latest_preview_file()
-    if not preview:
-        print("Run `python char_sorter.py sort --dry-run` first (it writes sort_preview.csv).")
-        return
-    data = load_tag_data()
-    hmap = load_hashtag_map()
-    n = no_data = 0
-    tag_counts, author_counts = Counter(), Counter()
-    with open(preview, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if r["folder"] != FOLDER_UNSORTED:
-                continue
-            n += 1
-            m = TWEET_ID_RE.search(os.path.basename(r["file"]))
-            entry = data.get(m.group(1)) if m else None
-            if not entry:
-                no_data += 1
-                continue
-            tags, author = entry
-            for t in tags:
-                if t not in hmap:
-                    tag_counts[t] += 1
-            if author:
-                author_counts[author.lower()] += 1
-    print(f"{n} images in {FOLDER_UNSORTED} ({no_data} with no tweet data).")
-    print(f"\nTop {top} hashtags on them that have no rule in hashtag_map.csv:")
-    for t, c in tag_counts.most_common(top):
-        print(f"{c:6d}  {t}")
-    print(f"\nTop {top} artists among them:")
-    for a, c in author_counts.most_common(top):
-        print(f"{c:6d}  {a}")
-
-
-def cmd_multiples(top=40):
-    """Read-only: which characters the tagger sees together in the images that end up in _Multiple."""
-    con = db_connect()
-    rows, labels = load_rows_with_labels(con, persist=False, detect=AUTO_LEARN)
-    pairs, sizes, total = Counter(), Counter(), 0
-    for p, t in rows:
-        if os.path.basename(p) in labels:
-            continue
-        if decide(t)[0] != "multiple":
-            continue
-        present = [x for x in merge_variants(t) if x[1] >= CONFIDENT]
-        total += 1
-        sizes[min(len(present), 4)] += 1
-        pairs[tuple(sorted((present[0][0], present[1][0])))] += 1
-    if not total:
-        print("No multiple-character images with the current settings.")
-        return
-    print(f"{total} images would go to {FOLDER_MULTIPLE} (characters above {CONFIDENT} with no clear leader):")
-    print(f"  exactly 2 characters: {sizes[2]}, 3: {sizes[3]}, 4 or more: {sizes[4]}")
-    print(f"\nTop {top} pairs (the two highest-scoring characters in each image):")
-    for (a, b), n in pairs.most_common(top):
-        print(f"{n:6d}  {a}  +  {b}")
-
-
-def hydrus_tag(namespace, name):
-    """Danbooru-style Hydrus tag: underscores become spaces, lowercase ('character:hu tao (genshin impact)')."""
-    return f"{namespace}:{str(name).replace('_', ' ').strip().lower()}"
-
-
-def series_tag(name):
-    """series:<name> without a trailing '(series)' (honkai_(series) -> series:honkai)."""
-    return re.sub(r"\s*\(series\)$", "", hydrus_tag("series", name))
-
-
-def series_names(guesses):
-    """All confident copyright (series) tags for one image, without sub-series and ignored tags."""
-    cands = [t for t, sc in (guesses or []) if sc >= SERIES_MIN_SCORE and t.lower() not in SERIES_IGNORE]
-    return [t for t in cands if not any(t != o and t.startswith(o + "_") for o in cands)]
-
-
-def cmd_export_hydrus(stage_dir=None, limit=0, guesses=True, clean=False):
-    """Write Hydrus sidecar files (<image>.txt, one tag per line) from everything the tool knows:
-    characters (variants merged, aliases applied, several per image allowed), series, artist, hashtags,
-    your manual labels, and optionally weak guesses under 'guess:'. Hydrus imports them with the images."""
-    import random
-    con = db_connect()
-    rows, labels = load_rows_with_labels(con, persist=False, detect=AUTO_LEARN)
-    if not rows:
-        print("Nothing scanned yet. Run `scan` first.")
-        return
-    if clean:
-        removed = 0
-        for p, _ in rows:
-            if os.path.exists(p + ".txt"):
-                os.remove(p + ".txt")
-                removed += 1
-        print(f"Removed {removed} sidecar files.")
-        return
-
-    series_scores = load_series_scores(con)
-    ttags = load_tweet_tags()
-    authors = load_tweet_authors()
-    rows = sorted(rows, key=lambda r: r[0])
-    if limit and limit < len(rows):
-        rows = random.Random(0).sample(rows, limit)   # fixed seed: the same test batch every time
-
-    written = skipped = 0
-    counts = Counter()
-    for p, top in rows:
-        name = os.path.basename(p)
-        m = TWEET_ID_RE.search(name)
-        tid = m.group(1) if m else None
-        tags = set()
-        for tag, sc in merge_variants(top):
-            if sc >= CONFIDENT:
-                tags.add(hydrus_tag("character", tag))
-                series = split_tag(tag)[1]
-                if series:
-                    tags.add(series_tag(series))
-            elif guesses and sc >= REVIEW:
-                tags.add(hydrus_tag("guess", tag))
-        if name in labels:
-            tags.add(hydrus_tag("character", labels[name].replace("\\", "/").split("/")[-1]))
-        for t in series_names(series_scores.get(name)):
-            tags.add(series_tag(t))
-        if tid:
-            if authors.get(tid):
-                tags.add(f"creator:{authors[tid]}")
-            for h in ttags.get(tid, ()):
-                tags.add(f"hashtag:{h}")
-        if not tags:
-            skipped += 1
-            continue
-        target = p
-        if stage_dir:
-            os.makedirs(stage_dir, exist_ok=True)
-            target = os.path.join(stage_dir, name)
-            if not os.path.exists(target):
-                shutil.copy2(p, target)
-        with open(target + ".txt", "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(sorted(tags)) + "\n")
-        written += 1
-        for t in tags:
-            counts[t.split(":", 1)[0]] += 1
-
-    where = f"in {stage_dir} (copies of the images)" if stage_dir else "next to the images"
-    print(f"Wrote {written} sidecar files {where}; {skipped} images had no tags at all.")
-    print("Tags by namespace: " + ", ".join(f"{k} {v}" for k, v in counts.most_common()))
-    print("Sidecars are named <image>.txt (for example 123_1.jpg.txt): newline-separated tags, "
-          "which is what Hydrus's default sidecar importer expects.")
-
-
-def cmd_tags(top=50, show_all=False):
-    """Most common hashtags, so you know what to add to config/hashtag_map.csv."""
-    ttags = load_tweet_tags()
-    if not ttags:
-        print("No hashtag data yet. Run `python char_sorter.py rebuild-tags` (or sync some likes first).")
-        return
-    hmap = load_hashtag_map()
-    counts = Counter(t for tags in ttags.values() for t in tags)
-    label = "all hashtags" if show_all else "hashtags NOT yet in hashtag_map.csv"
-    print(f"{len(ttags)} tweets with hashtag data. Top {top} {label}:")
-    shown = 0
-    for tag, n in counts.most_common():
-        if tag in hmap and not show_all:
-            continue
-        print(f"{n:6d}  {tag}" + (f"  -> {hmap[tag]}" if tag in hmap else ""))
-        shown += 1
-        if shown >= top:
-            break
-
-
-def cmd_inbox(dry_run):
-    if not list_images(INBOX_DIR):
-        print(f"No new images in {INBOX_DIR}.")
-        return
-    seen = ingest_sidecars([INBOX_DIR], move=not dry_run)
-    print(f"Tweet metadata read from {seen} sidecar files.")
-    cmd_scan(INBOX_DIR, quiet=True)
-    cmd_sort(dry_run, only_under=INBOX_DIR)
-    if not dry_run:
-        for root, dirs, files in os.walk(INBOX_DIR, topdown=False):
-            if root != INBOX_DIR and not os.listdir(root):
-                os.rmdir(root)
-
 def cmd_intake():
     """No sorting: read sidecars (moved to Meta/), tag every new image in the Inbox, leave the files where they are.
     push_to_hydrus.py then sends them (and any videos/GIFs) to Hydrus."""
@@ -1535,31 +656,8 @@ def cmd_intake():
 
 
 # ==============================================================================
-# UNDO & BENCH
+# BENCH
 # ==============================================================================
-def cmd_undo():
-    if not os.path.exists(LOG_FILE):
-        raise SystemExit(f"No {LOG_FILE} found.")
-    with open(LOG_FILE, newline="", encoding="utf-8") as f:
-        rows = list(csv.reader(f))
-    restored = missing = blocked = 0
-    con = db_connect()
-    for old, new in reversed(rows):
-        if not os.path.exists(new):
-            missing += 1
-        elif os.path.exists(old):
-            blocked += 1
-        else:
-            os.makedirs(os.path.dirname(old), exist_ok=True)
-            shutil.move(new, old)
-            con.execute("UPDATE scores SET path=? WHERE path=?", (old, new))
-            restored += 1
-    con.commit()
-    con.close()
-    print(f"Restored {restored}, missing {missing}, blocked {blocked}.")
-    if restored and not missing and not blocked:
-        os.replace(LOG_FILE, LOG_FILE + ".undone")
-
 
 
 def cmd_bench():
@@ -1632,45 +730,17 @@ def cmd_bench():
         print(f"  {rate:7.2f} img/s  {label}")
 
 
-
 # ==============================================================================
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["scan", "sort", "undo", "bench", "inbox", "intake", "tags", "rebuild-tags", "report", "suggest-map", "learn", "multiples", "export-hydrus"])
-    ap.add_argument("paths", nargs="*", help="rebuild-tags: folders of .json sidecars or an old tweet_hashtags.csv")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--top", type=int, default=50, help="tags: how many hashtags to show")
-    ap.add_argument("--all", action="store_true", help="tags: include hashtags already mapped")
-    ap.add_argument("--min-tweets", type=int, default=5, help="suggest-map: minimum tweets per hashtag")
-    ap.add_argument("--min-share", type=float, default=0.8, help="suggest-map: required share for the top character")
-    ap.add_argument("--apply", action="store_true", help="suggest-map: append the suggestions to hashtag_map.csv")
-    ap.add_argument("--limit", type=int, default=0, help="export-hydrus: only a random sample of this many images")
-    ap.add_argument("--no-guesses", action="store_true", help="export-hydrus: leave out weak 'guess:' tags")
-    ap.add_argument("--clean", action="store_true", help="export-hydrus: delete the sidecar files again")
+    ap = argparse.ArgumentParser(description="Tag images for Hydrus. See the top of this file.")
+    ap.add_argument("command", choices=["intake", "scan", "bench", "rebuild-tags"])
+    ap.add_argument("paths", nargs="*", help="scan: a folder to tag; rebuild-tags: folders of .json sidecars or an old tweet_hashtags.csv")
     a = ap.parse_args()
-    if a.command == "scan":
-        cmd_scan()
+    if a.command == "intake":
+        cmd_intake()
+    elif a.command == "scan":
+        cmd_scan(a.paths[0] if a.paths else None)
     elif a.command == "bench":
         cmd_bench()
-    elif a.command == "inbox":
-        cmd_inbox(a.dry_run)
-    elif a.command == "intake":
-        cmd_intake()
-    elif a.command == "learn":
-        cmd_learn()
-    elif a.command == "suggest-map":
-        cmd_suggest_map(a.min_tweets, a.min_share, a.apply)
-    elif a.command == "report":
-        cmd_report(a.top)
-    elif a.command == "multiples":
-        cmd_multiples(a.top)
-    elif a.command == "export-hydrus":
-        cmd_export_hydrus(a.paths[0] if a.paths else None, a.limit, not a.no_guesses, a.clean)
-    elif a.command == "tags":
-        cmd_tags(a.top, a.all)
-    elif a.command == "rebuild-tags":
-        cmd_rebuild_tags(a.paths)
-    elif a.command == "sort":
-        cmd_sort(a.dry_run)
     else:
-        cmd_undo()
+        cmd_rebuild_tags(a.paths)
